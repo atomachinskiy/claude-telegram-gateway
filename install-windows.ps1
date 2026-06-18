@@ -3,17 +3,23 @@
 #   powershell -ExecutionPolicy Bypass -File .\install-windows.ps1 [-Token <BOT_TOKEN>]
 # Token may also come from $env:TELEGRAM_BOT_TOKEN or an interactive prompt.
 # See AGENTS.md for rationale and the [VERIFY-PILOT] caveats. ASCII-only by design.
-param([string]$Token = $env:TELEGRAM_BOT_TOKEN)
+# For multiple bots/workspaces, run once per bot with distinct -StateDir/-TaskName/-LauncherName.
+param(
+  [string]$Token = $env:TELEGRAM_BOT_TOKEN,
+  [string]$StateDir,
+  [string]$TaskName = "tg-gateway",
+  [string]$LauncherName = "claude-tg.cmd"
+)
 
 $ErrorActionPreference = "Stop"
 function Say($m){ Write-Host "> $m" -ForegroundColor Cyan }
 function Die($m){ Write-Host "x $m" -ForegroundColor Red; exit 1 }
 
 $Repo  = $PSScriptRoot
-$State = if ($env:TELEGRAM_STATE_DIR) { $env:TELEGRAM_STATE_DIR } else { "$env:USERPROFILE\.claude\channels\tg-gateway" }
+$State = if ($StateDir) { $StateDir } elseif ($env:TELEGRAM_STATE_DIR) { $env:TELEGRAM_STATE_DIR } else { "$env:USERPROFILE\.claude\channels\tg-gateway" }
 $Gw    = Join-Path $Repo "gateway\dist\gateway.js"
 $BinDir   = "$env:USERPROFILE\.local\bin"
-$Launcher = Join-Path $BinDir "claude-tg.cmd"
+$Launcher = Join-Path $BinDir $LauncherName
 $Wrapper  = Join-Path $State "run-gateway.cmd"
 $Managed  = "C:\ProgramData\ClaudeCode\managed-settings.json"   # [VERIFY-PILOT]
 
@@ -38,7 +44,7 @@ if ((Test-Path $envFile) -and (Select-String -Path $envFile -Pattern '^TELEGRAM_
 
 # 2. Scheduled Task supervisor (at logon, restart on failure). Use a .cmd wrapper
 #    so TELEGRAM_STATE_DIR is carried into the process.
-Say "installing Scheduled Task 'tg-gateway' [VERIFY-PILOT]"
+Say "installing Scheduled Task '$TaskName' [VERIFY-PILOT]"
 @"
 @echo off
 set TELEGRAM_STATE_DIR=$State
@@ -47,8 +53,8 @@ set TELEGRAM_STATE_DIR=$State
 $action   = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$Wrapper`""
 $trigger  = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName "tg-gateway" -Action $action -Trigger $trigger -Settings $settings -RunLevel Limited -Force | Out-Null
-Start-ScheduledTask -TaskName "tg-gateway"
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -RunLevel Limited -Force | Out-Null
+Start-ScheduledTask -TaskName $TaskName
 Start-Sleep 2
 Say "task registered and started"
 
@@ -82,6 +88,7 @@ if ($isAdmin) {
 $flag = if ($devflag) { "--dangerously-load-development-channels" } else { "--channels" }
 @"
 @echo off
+set TELEGRAM_STATE_DIR=$State
 claude $flag plugin:telegram@telegram-local %*
 "@ | Set-Content -Path $Launcher -Encoding ASCII
 Say "launcher installed -> $Launcher"
@@ -89,6 +96,6 @@ Say "launcher installed -> $Launcher"
 Write-Host ""
 Say "DONE. Next:"
 Write-Host "   1) add $BinDir to PATH if it isn't (or run $Launcher directly)"
-Write-Host "   2) run:  claude-tg     (keep that window open - your Telegram-reachable session)"
+Write-Host "   2) run:  $LauncherName   (keep that window open - your Telegram-reachable session)"
 Write-Host "   3) message your bot from Telegram; type /menu for the control panel"
 if ($devflag) { Write-Host "   note: first launch asks consent once (dev flag) - accept it." }

@@ -34,7 +34,7 @@ script step misbehaves (it's the first pilot — expect to adjust the [VERIFY-PI
 
 ```bash
 # clone if not already (any stable location)
-git clone https://github.com/atomachinskiy/tg-gateway "$HOME/tg-gateway"   # REPO
+git clone https://github.com/atomachinskiy/claude-telegram-gateway "$HOME/tg-gateway"   # REPO
 ```
 
 ---
@@ -140,7 +140,9 @@ Create a command the user runs to start their bridged session (Variant 1 — the
 - If 3b succeeded (managed-settings): launch `claude --channels plugin:telegram@telegram-local`
 - If no admin (no 3b): launch `claude --dangerously-load-development-channels plugin:telegram@telegram-local` (Claude Code asks for consent ONCE per project, then remembers).
 
-macOS/Linux — add a `claude-tg` function/alias to the shell rc. Windows — a `claude-tg.cmd` on PATH. Tell the user: **run `claude-tg` whenever you want to be reachable from Telegram, and keep that window open.**
+- **Critical:** the launcher must export the SAME `TELEGRAM_STATE_DIR` the daemon uses (e.g. `~/.claude/channels/tg-gateway`) *before* invoking `claude`. The bridge defaults to a different dir (`telegram-claude5`) — without this it won't see the daemon's inbox/outbox and nothing flows.
+
+macOS/Linux — add a `claude-tg` function/alias to the shell rc (with `export TELEGRAM_STATE_DIR=…`). Windows — a `claude-tg.cmd` on PATH (with `set TELEGRAM_STATE_DIR=…`). Tell the user: **run `claude-tg` whenever you want to be reachable from Telegram, and keep that window open.**
 
 ---
 
@@ -165,6 +167,7 @@ If inbound messages don't reach the session: the allowlist isn't satisfied (revi
 
 ## Notes for the installing AI
 - The gateway and bridge are **node** bundles in `gateway/dist/` and `bridge/dist/` — no build step on the client.
+- **Multiple bots / workspaces:** one bot = one daemon = one `TELEGRAM_STATE_DIR` = one token. Pair + supervise once per bot, each with a distinct state dir (e.g. `…/channels/tg-bot1`), token, and supervisor name (`tg-gateway-bot1`). The bridge plugin (`telegram-local`) and the managed-settings allowlist are **shared** — register them once. Differentiate sessions by exporting that bot's `TELEGRAM_STATE_DIR` in its own launcher (`claude-tg-bot1.cmd`), and run the matching launcher inside the matching workspace. On Windows, `install-windows.ps1` accepts `-StateDir`, `-TaskName`, `-LauncherName` for exactly this — run it once per bot.
 - All config is `$STATE/gateway.env` (written by pairing). To add another allowed chat later, append its id to `TELEGRAM_ALLOWED_CHATS` (comma-separated) and restart the daemon.
 - The slick session-control panel (`/restart`, `/model`, `/screen`, terminal-dialog relay) needs the daemon to manage the Claude session in tmux — that's a server/headless setup, **not** this bridge deployment. Here the daemon only transports; `/menu`/`/status`/`/ping` still work (daemon-handled), but `/restart`/`/model`/`/screen` are no-ops without a managed tmux session.
 - Report back which **[VERIFY-PILOT]** steps worked as written vs. needed adjustment, so this runbook can be hardened.

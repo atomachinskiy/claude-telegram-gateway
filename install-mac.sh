@@ -85,6 +85,7 @@ else
 fi
 cat > "$LAUNCHER" <<LAUNCH
 #!/usr/bin/env bash
+export TELEGRAM_STATE_DIR="$STATE"
 exec $CMD "\$@"
 LAUNCH
 chmod +x "$LAUNCHER"
