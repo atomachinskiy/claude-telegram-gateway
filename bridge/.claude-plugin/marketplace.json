@@ -1,0 +1,12 @@
+{
+  "name": "telegram-local",
+  "owner": { "name": "atomachinskiy" },
+  "plugins": [
+    {
+      "name": "telegram",
+      "source": ".",
+      "description": "Telegram channel bridge over the supervised tg-gateway daemon",
+      "version": "0.1.0"
+    }
+  ]
+}

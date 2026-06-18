@@ -1,0 +1,6 @@
+{
+  "name": "telegram",
+  "description": "Telegram channel for Claude Code — thin bridge over the supervised tg-gateway daemon (reliable transport).",
+  "version": "0.1.0",
+  "keywords": ["telegram", "messaging", "channel", "mcp"]
+}

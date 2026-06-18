@@ -1,0 +1,1 @@
+{ "mcpServers": { "telegram": { "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/dist/bridge.js"] } } }
