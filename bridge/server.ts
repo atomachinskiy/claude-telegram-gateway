@@ -22,7 +22,7 @@ import { join } from "path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, unlinkSync, readdirSync } from "fs";
 import { randomUUID } from "crypto";
 
-const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), ".claude", "channels", "telegram-claude5");
+const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), ".claude", "channels", "tg-gateway");
 const INBOX = join(STATE_DIR, "inbox");
 const OUTBOX = join(STATE_DIR, "outbox");
 const OUTBOX_RES = join(OUTBOX, "res");

@@ -6,7 +6,7 @@ import { homedir } from "os";
 import { join } from "path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, unlinkSync, renameSync, statSync } from "fs";
 import { spawnSync } from "child_process";
-var STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), ".claude", "channels", "telegram-claude5");
+var STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), ".claude", "channels", "tg-gateway");
 var INBOX = join(STATE_DIR, "inbox");
 var OUTBOX = join(STATE_DIR, "outbox");
 var OUTBOX_RES = join(OUTBOX, "res");
@@ -41,7 +41,7 @@ var ALLOWED_CHATS = new Set([
 function isAllowedChat(chatId, userId) {
   return ALLOWED_CHATS.has("*") || ALLOWED_CHATS.has(chatId) || SYS_ADMINS.has(userId);
 }
-var TMUX_SESSION = process.env.CLAUDE5_TMUX ?? "claude5";
+var TMUX_SESSION = process.env.CLAUDE_TMUX ?? "claude";
 var SYS_RESTART_CMD = process.env.SYS_RESTART_CMD ?? "";
 var BRIDGE_HEARTBEAT = join(STATE_DIR, "bridge.heartbeat");
 var ACK_EMOJI = process.env.TELEGRAM_ACK_EMOJI ?? "\uD83D\uDC40";
@@ -202,6 +202,18 @@ async function transcribeVoice(fileId) {
     return null;
   }
 }
+function buttonLabel(msg, data) {
+  const rows = msg?.reply_markup?.inline_keyboard;
+  if (!Array.isArray(rows))
+    return null;
+  for (const row of rows)
+    for (const b of row)
+      if (b?.callback_data === data) {
+        const t = String(b.text ?? "").trim();
+        return t || null;
+      }
+  return null;
+}
 async function handleCallback(cq) {
   const data = cq.data ?? "";
   const askMatch = /^ask:([^:]+):(\d+)$/.exec(data);
@@ -241,36 +253,46 @@ async function handleCallback(cq) {
       return void sysSendKeys(chat_id, rest.slice(3));
     if (rest === "models")
       return void sysModels(chat_id);
+    if (rest === "mcp")
+      return void sysMcp(chat_id);
     if (rest.startsWith("model:"))
       return void sysSetModel(chat_id, rest.slice(6), messageId);
     if (rest.startsWith("tui:"))
       return void sysTuiKey(chat_id, rest.slice(4), messageId);
     return;
   }
-  try {
-    await call("answerCallbackQuery", { callback_query_id: cq.id });
-  } catch (e) {
-    LOG(`answerCallbackQuery: ${e.message}`);
-  }
   const from = cq.from ?? {};
   const msg = cq.message ?? {};
   if (!isAllowedChat(String(msg.chat?.id ?? from.id ?? ""), String(from.id ?? ""))) {
+    try {
+      await call("answerCallbackQuery", { callback_query_id: cq.id });
+    } catch {}
     LOG(`DROP callback from non-allowed ${from.id}`);
     return;
   }
+  const label = buttonLabel(msg, data) || data;
+  const chatId = String(msg.chat?.id ?? from.id);
+  try {
+    await call("answerCallbackQuery", { callback_query_id: cq.id, text: `\u2713 ${label}`.slice(0, 190) });
+  } catch (e) {
+    LOG(`answerCallbackQuery: ${e.message}`);
+  }
+  if (msg.message_id != null) {
+    try {
+      await call("editMessageReplyMarkup", { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: [] } });
+    } catch {}
+  }
   const base = {
-    chat_id: String(msg.chat?.id ?? from.id),
-    message_id: String(msg.message_id ?? ""),
+    chat_id: chatId,
+    message_id: String(Date.now()),
     user: from.username ?? `${from.first_name ?? "user"}`,
     user_id: String(from.id ?? ""),
     ts: new Date().toISOString(),
-    text: `[inline button] ${cq.data ?? ""}`,
-    callback_data: cq.data ?? "",
-    callback_query_id: cq.id,
-    is_callback: true
+    text: label,
+    callback_data: data
   };
-  writeInbox(`${Date.now()}-cb-${cq.id}.json`, base);
-  LOG(`inbox <- callback chat ${base.chat_id} data="${cq.data}"`);
+  writeInbox(`${Date.now()}-cbm-${cq.id}.json`, base);
+  LOG(`inbox <- button-tap chat ${chatId} data="${data}" label="${label}"`);
 }
 async function handleUpdate(u) {
   if (u.callback_query)
@@ -285,7 +307,7 @@ async function handleUpdate(u) {
     return;
   }
   const text0 = (msg.text ?? "").trim();
-  if (/^\/(sys|menu|ping|status|restart|screen|logs|model|models)\b/i.test(text0)) {
+  if (/^\/(sys|menu|ping|status|restart|screen|logs|model|models|mcp)\b/i.test(text0)) {
     if (!SYS_ADMINS.has(String(from.id ?? ""))) {
       await call("sendMessage", { chat_id: String(msg.chat.id), text: "\u26D4 \u041A\u043E\u043C\u0430\u043D\u0434\u044B \u0443\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0438\u044F \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u044B \u0442\u043E\u043B\u044C\u043A\u043E \u0432\u043B\u0430\u0434\u0435\u043B\u044C\u0446\u0443." }).catch(() => {});
       return;
@@ -370,7 +392,19 @@ function normalizeButtons(buttons) {
   return { inline_keyboard };
 }
 function unescapeMd(s) {
-  return s.replace(/\\([_*\[\]()~`>#+\-=|{}.!])/g, "$1");
+  let out = "";
+  for (let i = 0;i < s.length; i++) {
+    const c = s[i];
+    if (c === "\\" && i + 1 < s.length) {
+      out += c + s[i + 1];
+      i++;
+      continue;
+    }
+    if (c === "*" || c === "_" || c === "~" || c === "`" || c === "|")
+      continue;
+    out += c;
+  }
+  return out.replace(/\\([_*\[\]()~`>#+\-=|{}.!])/g, "$1");
 }
 async function sendReply(args) {
   const { chat_id, text, format, reply_to, files, disable_notification } = args;
@@ -550,11 +584,11 @@ function lastPollAgo() {
   return status.lastPollOk ? Math.round((Date.now() - new Date(status.lastPollOk).getTime()) / 1000) : -1;
 }
 function sysMenu(chat_id) {
-  return sendReply({ chat_id, text: "\uD83C\uDF9B \u041F\u0430\u043D\u0435\u043B\u044C \u0443\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0438\u044F claude5", buttons: [
+  return sendReply({ chat_id, text: "\uD83C\uDF9B \u041F\u0430\u043D\u0435\u043B\u044C \u0443\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0438\u044F Claude", buttons: [
     [{ text: "\uD83D\uDCCA \u0421\u0442\u0430\u0442\u0443\u0441", data: "sys:status" }, { text: "\uD83D\uDD04 \u0420\u0435\u0441\u0442\u0430\u0440\u0442", data: "sys:restart" }],
     [{ text: "\uD83D\uDCDC \u041B\u043E\u0433\u0438", data: "sys:logs" }, { text: "\uD83D\uDDA5 \u042D\u043A\u0440\u0430\u043D", data: "sys:screen" }],
     [{ text: "\uD83D\uDDDC /compact", data: "sys:cc:/compact" }, { text: "\uD83E\uDDF9 /clear", data: "sys:cc:/clear" }],
-    [{ text: "\uD83E\uDDE0 \u041C\u043E\u0434\u0435\u043B\u044C", data: "sys:models" }]
+    [{ text: "\uD83E\uDDE0 \u041C\u043E\u0434\u0435\u043B\u044C", data: "sys:models" }, { text: "\uD83D\uDD0C MCP", data: "sys:mcp" }]
   ] });
 }
 async function sysStatus(chat_id) {
@@ -592,9 +626,26 @@ function sysScreen(chat_id) {
   const out = c.out.split(`
 `).filter((l) => l.trim()).slice(-40).join(`
 `).slice(-3500);
-  return sendReply({ chat_id, text: `\uD83D\uDDA5 \u042D\u043A\u0440\u0430\u043D claude5:
+  return sendReply({ chat_id, text: `\uD83D\uDDA5 \u042D\u043A\u0440\u0430\u043D Claude:
 
 ` + (out || "(\u043F\u0443\u0441\u0442\u043E)") });
+}
+async function sysMcp(chat_id) {
+  if (!sh(["tmux", "has-session", "-t", TMUX_SESSION]).ok)
+    return sendReply({ chat_id, text: `\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F ${TMUX_SESSION} \u043D\u0435 \u0437\u0430\u043F\u0443\u0449\u0435\u043D\u0430 \u2014 \u043F\u0430\u043D\u0435\u043B\u044C /mcp \u043F\u043E\u043A\u0430\u0437\u044B\u0432\u0430\u0442\u044C \u043D\u0435\u0433\u0434\u0435.` });
+  sh(["tmux", "send-keys", "-t", TMUX_SESSION, "-l", "/mcp"]);
+  sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"]);
+  await sleep(2000);
+  const cap = sh(["tmux", "capture-pane", "-t", TMUX_SESSION, "-p"]);
+  const out = cap.ok ? cap.out.split(`
+`).filter((l) => l.trim()).slice(-45).join(`
+`).slice(-3500) : "(\u044D\u043A\u0440\u0430\u043D \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D)";
+  sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Escape"]);
+  await sleep(250);
+  sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Escape"]);
+  return sendReply({ chat_id, text: `\uD83D\uDD0C \u041F\u0430\u043D\u0435\u043B\u044C /mcp \u0432 \u0441\u0435\u0441\u0441\u0438\u0438:
+
+${out || "(\u043F\u0443\u0441\u0442\u043E)"}` });
 }
 async function sysSendKeys(chat_id, keys) {
   keys = keys.trim();
@@ -611,7 +662,7 @@ async function sysSendKeys(chat_id, keys) {
   const out = cap.ok ? cap.out.split(`
 `).filter((l) => l.trim()).slice(-30).join(`
 `).slice(-3000) : "(\u044D\u043A\u0440\u0430\u043D \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D)";
-  return sendReply({ chat_id, text: `\u2328\uFE0F \u041E\u0442\u043F\u0440\u0430\u0432\u0438\u043B \u0432 claude5: ${keys}
+  return sendReply({ chat_id, text: `\u2328\uFE0F \u041E\u0442\u043F\u0440\u0430\u0432\u0438\u043B \u0432 Claude: ${keys}
 
 \uD83D\uDDA5 \u042D\u043A\u0440\u0430\u043D:
 ${out}` });
@@ -720,7 +771,7 @@ ${out || "(\u043F\u0443\u0441\u0442\u043E)"}`;
     sendReply({ chat_id, text: txt });
 }
 function sysRestartPrompt(chat_id) {
-  return sendReply({ chat_id, text: "\uD83D\uDD04 \u041F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u0442\u0438\u0442\u044C \u0441\u0435\u0441\u0441\u0438\u044E claude5? \u0414\u0435\u043C\u043E\u043D \u0443\u0431\u044C\u0451\u0442 \u0438 \u043F\u043E\u0434\u043D\u0438\u043C\u0435\u0442 \u0435\u0451 \u0437\u0430\u043D\u043E\u0432\u043E; \u0432\u0445\u043E\u0434\u044F\u0449\u0438\u0435 \u0432 \u044D\u0442\u043E \u0432\u0440\u0435\u043C\u044F \u0431\u0443\u0444\u0435\u0440\u0438\u0437\u0443\u044E\u0442\u0441\u044F \u0438 \u0434\u043E\u0433\u0440\u0443\u0437\u044F\u0442\u0441\u044F.", buttons: [
+  return sendReply({ chat_id, text: "\uD83D\uDD04 \u041F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u0442\u0438\u0442\u044C \u0441\u0435\u0441\u0441\u0438\u044E Claude? \u0414\u0435\u043C\u043E\u043D \u0443\u0431\u044C\u0451\u0442 \u0438 \u043F\u043E\u0434\u043D\u0438\u043C\u0435\u0442 \u0435\u0451 \u0437\u0430\u043D\u043E\u0432\u043E; \u0432\u0445\u043E\u0434\u044F\u0449\u0438\u0435 \u0432 \u044D\u0442\u043E \u0432\u0440\u0435\u043C\u044F \u0431\u0443\u0444\u0435\u0440\u0438\u0437\u0443\u044E\u0442\u0441\u044F \u0438 \u0434\u043E\u0433\u0440\u0443\u0437\u044F\u0442\u0441\u044F.", buttons: [
     [{ text: "\u2705 \u041F\u043E\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u044C", data: "sys:restart:yes" }, { text: "\u274C \u041E\u0442\u043C\u0435\u043D\u0430", data: "sys:restart:no" }]
   ] });
 }
@@ -732,7 +783,7 @@ async function doRestart(chat_id, messageId) {
   if (Date.now() - lastRestartAt < 60000)
     return void editOrSend("\u23F3 \u0420\u0435\u0441\u0442\u0430\u0440\u0442 \u0443\u0436\u0435 \u0437\u0430\u043F\u0443\u0441\u043A\u0430\u043B\u0441\u044F <1 \u043C\u0438\u043D \u043D\u0430\u0437\u0430\u0434. \u041F\u043E\u0434\u043E\u0436\u0434\u0438.");
   lastRestartAt = Date.now();
-  await editOrSend("\uD83D\uDD04 \u041F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u0430\u044E \u0441\u0435\u0441\u0441\u0438\u044E claude5...");
+  await editOrSend("\uD83D\uDD04 \u041F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u0430\u044E \u0441\u0435\u0441\u0441\u0438\u044E Claude...");
   const r = sh(["bash", SYS_RESTART_CMD], 20000);
   await sendReply({ chat_id, text: r.ok ? "\u2705 \u0420\u0435\u0441\u0442\u0430\u0440\u0442 \u0437\u0430\u043F\u0443\u0449\u0435\u043D. \u0421\u0435\u0441\u0441\u0438\u044F \u043F\u043E\u0434\u043D\u0438\u043C\u0435\u0442\u0441\u044F \u0437\u0430 ~15\u0441, \u043D\u043E\u0432\u044B\u0439 \u0438\u043D\u0441\u0442\u0430\u043D\u0441 \u043E\u0442\u0432\u0435\u0442\u0438\u0442 \u043A\u0430\u043A \u0431\u0443\u0434\u0435\u0442 \u0433\u043E\u0442\u043E\u0432." : `\u274C \u0420\u0435\u0441\u0442\u0430\u0440\u0442 \u043D\u0435 \u0443\u0434\u0430\u043B\u0441\u044F: ${r.out}` });
 }
@@ -743,6 +794,7 @@ var BOT_COMMANDS = [
   { command: "screen", description: "\u041F\u043E\u043A\u0430\u0437\u0430\u0442\u044C \u044D\u043A\u0440\u0430\u043D \u0441\u0435\u0441\u0441\u0438\u0438" },
   { command: "restart", description: "\u041F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u0442\u0438\u0442\u044C \u0441\u0435\u0441\u0441\u0438\u044E" },
   { command: "model", description: "\uD83E\uDDE0 \u0412\u044B\u0431\u0440\u0430\u0442\u044C \u043C\u043E\u0434\u0435\u043B\u044C" },
+  { command: "mcp", description: "\uD83D\uDD0C \u0421\u0442\u0430\u0442\u0443\u0441 MCP-\u0441\u0435\u0440\u0432\u0435\u0440\u043E\u0432" },
   { command: "logs", description: "\u041B\u043E\u0433 gateway" }
 ];
 async function registerCommands() {
@@ -783,10 +835,12 @@ async function handleSysCommand(chat_id, text) {
     case "model":
     case "models":
       return sysModels(chat_id);
+    case "mcp":
+      return sysMcp(chat_id);
     case "cc":
       return sysSendKeys(chat_id, text.replace(/^\/sys\s+cc\s*/i, ""));
     default:
-      return sendReply({ chat_id, text: "\u041A\u043E\u043C\u0430\u043D\u0434\u044B: /menu \xB7 /sys ping \xB7 /sys status \xB7 /sys logs \xB7 /sys screen \xB7 /sys restart \xB7 /sys cc <\u043A\u043E\u043C\u0430\u043D\u0434\u0430> (\u043D\u0430\u043F\u0440. /sys cc /compact)" });
+      return sendReply({ chat_id, text: "\u041A\u043E\u043C\u0430\u043D\u0434\u044B: /menu \xB7 /sys ping \xB7 /sys status \xB7 /sys logs \xB7 /sys screen \xB7 /sys restart \xB7 /sys mcp \xB7 /sys cc <\u043A\u043E\u043C\u0430\u043D\u0434\u0430> (\u043D\u0430\u043F\u0440. /sys cc /compact)" });
   }
 }
 async function pumpOutbox() {
@@ -840,13 +894,13 @@ function checkBrain() {
   if (brainWasAlive === null) {
     brainWasAlive = alive;
     if (!alive)
-      tell(`\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F claude5 \u043D\u0435 \u043D\u0430 \u0441\u0432\u044F\u0437\u0438 (heartbeat \u043C\u043E\u0441\u0442\u0430 ${age === Infinity ? "\u043E\u0442\u0441\u0443\u0442\u0441\u0442\u0432\u0443\u0435\u0442" : "\u0443\u0441\u0442\u0430\u0440\u0435\u043B"}). \u0412\u0445\u043E\u0434\u044F\u0449\u0438\u0435 \u0431\u0443\u0444\u0435\u0440\u0438\u0437\u0443\u044E\u0442\u0441\u044F. \u041F\u043E\u0434\u043D\u0438\u043C\u0438 \u0435\u0451: /restart`);
+      tell(`\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F Claude \u043D\u0435 \u043D\u0430 \u0441\u0432\u044F\u0437\u0438 (heartbeat \u043C\u043E\u0441\u0442\u0430 ${age === Infinity ? "\u043E\u0442\u0441\u0443\u0442\u0441\u0442\u0432\u0443\u0435\u0442" : "\u0443\u0441\u0442\u0430\u0440\u0435\u043B"}). \u0412\u0445\u043E\u0434\u044F\u0449\u0438\u0435 \u0431\u0443\u0444\u0435\u0440\u0438\u0437\u0443\u044E\u0442\u0441\u044F. \u041F\u043E\u0434\u043D\u0438\u043C\u0438 \u0435\u0451: /restart`);
   } else if (brainWasAlive && !alive) {
     brainWasAlive = false;
-    tell(`\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F claude5 \u043C\u043E\u043B\u0447\u0438\u0442 ~${Math.round(age / 60000)} \u043C\u0438\u043D \u2014 \u043C\u043E\u0441\u0442 \u043F\u0435\u0440\u0435\u0441\u0442\u0430\u043B \u0441\u043B\u0430\u0442\u044C heartbeat. \u0412\u0445\u043E\u0434\u044F\u0449\u0438\u0435 \u0431\u0443\u0444\u0435\u0440\u0438\u0437\u0443\u044E\u0442\u0441\u044F \u0438 \u0434\u043E\u0435\u0434\u0443\u0442. \u0416\u043C\u0438 /restart, \u0434\u0435\u0442\u0430\u043B\u0438: /status`);
+    tell(`\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F Claude \u043C\u043E\u043B\u0447\u0438\u0442 ~${Math.round(age / 60000)} \u043C\u0438\u043D \u2014 \u043C\u043E\u0441\u0442 \u043F\u0435\u0440\u0435\u0441\u0442\u0430\u043B \u0441\u043B\u0430\u0442\u044C heartbeat. \u0412\u0445\u043E\u0434\u044F\u0449\u0438\u0435 \u0431\u0443\u0444\u0435\u0440\u0438\u0437\u0443\u044E\u0442\u0441\u044F \u0438 \u0434\u043E\u0435\u0434\u0443\u0442. \u0416\u043C\u0438 /restart, \u0434\u0435\u0442\u0430\u043B\u0438: /status`);
   } else if (!brainWasAlive && alive) {
     brainWasAlive = true;
-    tell("\uD83D\uDFE2 \u0421\u0435\u0441\u0441\u0438\u044F claude5 \u0441\u043D\u043E\u0432\u0430 \u043D\u0430 \u0441\u0432\u044F\u0437\u0438 \u2014 heartbeat \u043F\u043E\u0448\u0451\u043B, \u0431\u044D\u043A\u043B\u043E\u0433 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0439 \u0434\u043E\u0435\u0437\u0436\u0430\u0435\u0442.");
+    tell("\uD83D\uDFE2 \u0421\u0435\u0441\u0441\u0438\u044F Claude \u0441\u043D\u043E\u0432\u0430 \u043D\u0430 \u0441\u0432\u044F\u0437\u0438 \u2014 heartbeat \u043F\u043E\u0448\u0451\u043B, \u0431\u044D\u043A\u043B\u043E\u0433 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0439 \u0434\u043E\u0435\u0437\u0436\u0430\u0435\u0442.");
   }
 }
 function cleanupRes() {

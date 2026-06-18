@@ -5,17 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/home/ubuntu/.bun/bin/bun /home/ubuntu/tg-gateway/gateway/gateway.ts
+# Runs the prebuilt node bundle (no bun needed on the client). The bot token and
+# owner are read from gateway.env in the state dir (written by `pair`).
+ExecStart=/usr/bin/env node %h/tg-gateway/gateway/dist/gateway.js
 Restart=always
 RestartSec=2
 MemoryMax=400M
-# token is read from ~/.claude/secrets/telegram-bot-token (production bot)
-Environment=TELEGRAM_STATE_DIR=/home/ubuntu/.claude/channels/telegram-claude5
-Environment=TELEGRAM_SYS_ADMINS=123456789
-Environment=CLAUDE5_TMUX=claude5
-Environment=SYS_RESTART_CMD=/home/ubuntu/tg-gateway/bin/restart-claude5.sh
-# PATH so the daemon can shell out to tmux/pgrep/ps/journalctl/bash for /sys commands
-Environment=PATH=/home/ubuntu/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TELEGRAM_STATE_DIR=%h/.claude/channels/tg-gateway
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target

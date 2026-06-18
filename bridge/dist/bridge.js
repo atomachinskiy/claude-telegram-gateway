@@ -13454,7 +13454,7 @@ import { homedir } from "os";
 import { join } from "path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, unlinkSync, readdirSync } from "fs";
 import { randomUUID } from "crypto";
-var STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), ".claude", "channels", "telegram-claude5");
+var STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), ".claude", "channels", "tg-gateway");
 var INBOX = join(STATE_DIR, "inbox");
 var OUTBOX = join(STATE_DIR, "outbox");
 var OUTBOX_RES = join(OUTBOX, "res");

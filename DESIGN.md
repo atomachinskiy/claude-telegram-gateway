@@ -1,7 +1,7 @@
 # tg-gateway — стабильный Telegram-канал для Claude Code
 
-Дата: 2026-06-09 · Автор: server-claude5 (как CTO, по запросу Андрея) · Статус: в разработке
-Развивает: PRD `Андрей (мета)/Roadmaps/Продукты/2026-05-26 — PRD — TG-плагин для Claude Code v0.1.md`
+Дата: 2026-06-09 · Автор: Claude (как CTO, по запросу владельца) · Статус: в разработке
+Развивает: внутренний PRD «TG-плагин для Claude Code v0.1» (2026-05-26).
 
 ## 1. Проблема
 
@@ -25,7 +25,7 @@ Telegram Bot API
    v                                                      |
 +-------------------------- tg-gateway (демон, systemd Restart=always) -----------+
 |  poll.ts  робастный long-poll: graduated backoff, 409-handler, drain, DNS-fb    |
-|  inbox writer  входящие -> ~/.claude/channels/telegram-claude5/inbox/<f>.json   |
+|  inbox writer  входящие -> ~/.claude/channels/tg-gateway/inbox/<f>.json   |
 |  media downloader  фото/голос/док -> в ту же inbox-папку                         |
 |  outbox watcher  читает outbox/req-*.json -> шлёт -> пишет outbox/res/<id>.json  |
 +----------------------------------------------------------------------------------+
@@ -69,9 +69,9 @@ Outbox req: `{ id, tool, args }`. Outbox res: `{ id, ok, result?, error? }`.
 
 ## 6. Деплой и cutover
 
-- Демон ставится как `~/.config/systemd/user/tg-gateway.service` (Restart=always, WantedBy=default.target, токен из `~/.claude/secrets/telegram-bot-token`).
-- В `claude5-start` плагин `--channels` меняется с официального на наш `tg-bridge`.
-- Cutover: остановить официальный плагин (он единственный поллер) -> запустить демон -> перезапустить claude5 с мостом. Откат: вернуть `--channels` на официальный.
+- Демон ставится как `~/.config/systemd/user/tg-gateway.service` (Restart=always, WantedBy=default.target, токен из `gateway.env (пишется при pairing)`).
+- В лаунчере сессии плагин `--channels` меняется с официального на наш `tg-bridge`.
+- Cutover: остановить официальный плагин (он единственный поллер) -> запустить демон -> перезапустить сессию Claude с мостом. Откат: вернуть `--channels` на официальный.
 - Тестирование polling требует отдельного тестового бота ИЛИ окна, когда официальный плагин остановлен (один поллер на токен).
 
 ## 7. Фазы

@@ -9,7 +9,7 @@ import { join } from "path";
 import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, unlinkSync, renameSync, statSync } from "fs";
 import { spawnSync } from "child_process"; // node builtin — works on both bun and node runtimes
 
-const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), ".claude", "channels", "telegram-claude5");
+const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), ".claude", "channels", "tg-gateway");
 const INBOX = join(STATE_DIR, "inbox");
 const OUTBOX = join(STATE_DIR, "outbox");
 const OUTBOX_RES = join(OUTBOX, "res");
@@ -48,7 +48,7 @@ const ALLOWED_CHATS = new Set([
 function isAllowedChat(chatId: string, userId: string): boolean {
   return ALLOWED_CHATS.has("*") || ALLOWED_CHATS.has(chatId) || SYS_ADMINS.has(userId);
 }
-const TMUX_SESSION = process.env.CLAUDE5_TMUX ?? "claude5";
+const TMUX_SESSION = process.env.CLAUDE_TMUX ?? "claude";
 const SYS_RESTART_CMD = process.env.SYS_RESTART_CMD ?? ""; // path to restart script; empty = restart disabled (safe default)
 const BRIDGE_HEARTBEAT = join(STATE_DIR, "bridge.heartbeat");
 // Instant transport-level acknowledgement: react to an inbound message so the user
@@ -502,7 +502,7 @@ function sessionState(): { alive: boolean; detail: string } {
 function lastPollAgo(): number { return status.lastPollOk ? Math.round((Date.now() - new Date(status.lastPollOk).getTime()) / 1000) : -1; }
 
 function sysMenu(chat_id: string) {
-  return sendReply({ chat_id, text: "🎛 Панель управления claude5", buttons: [
+  return sendReply({ chat_id, text: "🎛 Панель управления Claude", buttons: [
     [{ text: "📊 Статус", data: "sys:status" }, { text: "🔄 Рестарт", data: "sys:restart" }],
     [{ text: "📜 Логи", data: "sys:logs" }, { text: "🖥 Экран", data: "sys:screen" }],
     [{ text: "🗜 /compact", data: "sys:cc:/compact" }, { text: "🧹 /clear", data: "sys:cc:/clear" }],
@@ -533,7 +533,7 @@ function sysScreen(chat_id: string) {
   const c = sh(["tmux", "capture-pane", "-t", TMUX_SESSION, "-p"]);
   if (!c.ok) return sendReply({ chat_id, text: `🖥 Экран недоступен: ${c.out || "нет сессии " + TMUX_SESSION}` });
   const out = c.out.split("\n").filter(l => l.trim()).slice(-40).join("\n").slice(-3500);
-  return sendReply({ chat_id, text: "🖥 Экран claude5:\n\n" + (out || "(пусто)") });
+  return sendReply({ chat_id, text: "🖥 Экран Claude:\n\n" + (out || "(пусто)") });
 }
 // Live MCP status: drive the in-session /mcp panel (same send-keys path as /model).
 // Deliberately NOT `claude mcp list` — that spawns a 2nd process that 409-conflicts
@@ -562,7 +562,7 @@ async function sysSendKeys(chat_id: string, keys: string) {
   await sleep(1500);
   const cap = sh(["tmux", "capture-pane", "-t", TMUX_SESSION, "-p"]);
   const out = cap.ok ? cap.out.split("\n").filter(l => l.trim()).slice(-30).join("\n").slice(-3000) : "(экран недоступен)";
-  return sendReply({ chat_id, text: `⌨️ Отправил в claude5: ${keys}\n\n🖥 Экран:\n${out}` });
+  return sendReply({ chat_id, text: `⌨️ Отправил в Claude: ${keys}\n\n🖥 Экран:\n${out}` });
 }
 // Model picker — switches the LIVE session model via the in-session /model command
 // (send-keys, same path as /sys cc). No restart: Claude Code picks the model up on the fly.
@@ -641,7 +641,7 @@ async function sysTuiKey(chat_id: string, key: string, messageId?: number) {
   else sendReply({ chat_id, text: txt });
 }
 function sysRestartPrompt(chat_id: string) {
-  return sendReply({ chat_id, text: "🔄 Перезапустить сессию claude5? Демон убьёт и поднимет её заново; входящие в это время буферизуются и догрузятся.", buttons: [
+  return sendReply({ chat_id, text: "🔄 Перезапустить сессию Claude? Демон убьёт и поднимет её заново; входящие в это время буферизуются и догрузятся.", buttons: [
     [{ text: "✅ Подтвердить", data: "sys:restart:yes" }, { text: "❌ Отмена", data: "sys:restart:no" }],
   ] });
 }
@@ -651,7 +651,7 @@ async function doRestart(chat_id: string, messageId?: number) {
   if (!SYS_RESTART_CMD) return void editOrSend("⚠️ Рестарт не настроен на этом инстансе (SYS_RESTART_CMD пуст).");
   if (Date.now() - lastRestartAt < 60_000) return void editOrSend("⏳ Рестарт уже запускался <1 мин назад. Подожди.");
   lastRestartAt = Date.now();
-  await editOrSend("🔄 Перезапускаю сессию claude5...");
+  await editOrSend("🔄 Перезапускаю сессию Claude...");
   const r = sh(["bash", SYS_RESTART_CMD], 20_000);
   await sendReply({ chat_id, text: r.ok ? "✅ Рестарт запущен. Сессия поднимется за ~15с, новый инстанс ответит как будет готов." : `❌ Рестарт не удался: ${r.out}` });
 }
@@ -728,13 +728,13 @@ function checkBrain() {
   const tell = (t: string) => { for (const a of SYS_ADMINS) sendReply({ chat_id: a, text: t }).catch(() => {}); };
   if (brainWasAlive === null) {
     brainWasAlive = alive;
-    if (!alive) tell(`🔴 Сессия claude5 не на связи (heartbeat моста ${age === Infinity ? "отсутствует" : "устарел"}). Входящие буферизуются. Подними её: /restart`);
+    if (!alive) tell(`🔴 Сессия Claude не на связи (heartbeat моста ${age === Infinity ? "отсутствует" : "устарел"}). Входящие буферизуются. Подними её: /restart`);
   } else if (brainWasAlive && !alive) {
     brainWasAlive = false;
-    tell(`🔴 Сессия claude5 молчит ~${Math.round(age / 60_000)} мин — мост перестал слать heartbeat. Входящие буферизуются и доедут. Жми /restart, детали: /status`);
+    tell(`🔴 Сессия Claude молчит ~${Math.round(age / 60_000)} мин — мост перестал слать heartbeat. Входящие буферизуются и доедут. Жми /restart, детали: /status`);
   } else if (!brainWasAlive && alive) {
     brainWasAlive = true;
-    tell("🟢 Сессия claude5 снова на связи — heartbeat пошёл, бэклог сообщений доезжает.");
+    tell("🟢 Сессия Claude снова на связи — heartbeat пошёл, бэклог сообщений доезжает.");
   }
 }
 // Orphaned outbox results (bridge died mid-wait) otherwise pile up forever.

@@ -1,29 +1,23 @@
-# tg-gateway
+# tg-gateway — надёжный Telegram-канал для Claude Code
 
-Надёжный Telegram-канал для Claude Code. Транспорт вынесен в supervised-демон, в сессии Клода только тонкий мост без сети. См. DESIGN.md.
+Транспорт Telegram вынесен в отдельный супервизируемый демон, а в сессии Claude работает только тонкий мост без сети. Поэтому канал не разваливается, как встроенный плагин: даже если сессия моргнёт, демон держит коннект и буферит входящие — ничего не теряется. Архитектура — в [DESIGN.md](DESIGN.md).
 
 ## Состав
-- `gateway/gateway.ts` — демон: робастный long-poll (graduated backoff, 409-handler, drain), inbox-writer, media, outbox-sender. Без зависимостей (голый fetch).
-- `bridge/server.ts` — тонкий MCP-плагин для `--channels`: тулы reply/react/edit_message/download_attachment пишут в outbox и ждут ответ демона. Без сети.
-- `systemd/tg-gateway.service` — user-сервис, Restart=always.
+- `gateway/` — демон: робастный long-poll (graduated backoff, 409-handler, drain), запись inbox, медиа, отправка outbox. Без зависимостей (голый fetch). Готовый бандл — `gateway/dist/gateway.js`.
+- `bridge/` — тонкий MCP-плагин для `--channels`: тулы `reply`/`react`/`edit_message`/`download_attachment`/`ask`/`status` пишут в outbox и ждут ответ демона. Сети нет. Бандл — `bridge/dist/bridge.js`.
+- `install-windows.ps1`, `install-mac.sh` — идемпотентные инсталлеры (pairing → супервизор → плагин-мост → launcher).
+- `systemd/tg-gateway.service` — шаблон user-сервиса для Linux.
 
-## Запуск демона
-    cp systemd/tg-gateway.service ~/.config/systemd/user/
-    systemctl --user daemon-reload && systemctl --user enable --now tg-gateway
-    journalctl --user -u tg-gateway -f
+## Установка
+Полный пошаговый runbook (в т.ч. пригодный для ИИ-ассистента) — в [AGENTS.md](AGENTS.md). Коротко:
+- **Windows:** `powershell -ExecutionPolicy Bypass -File .\install-windows.ps1`
+- **macOS:** `./install-mac.sh`
+- **Linux:** см. AGENTS.md (systemd `--user`).
 
-## Cutover (боевой бот)
-Telegram держит ОДИН getUpdates-поллер на токен. Порядок:
-1. Остановить официальный плагин (он единственный поллер): в claude5-start убрать `--channels plugin:telegram@claude-plugins-official`.
-2. Запустить демон (systemd, см. выше).
-3. Подключить наш мост как `--channels` (локальный плагин), перезапустить claude5.
-Откат: вернуть `--channels` на официальный, остановить демон.
+Нужен только Node 18+ (он уже стоит вместе с Claude Code) и токен бота от [@BotFather](https://t.me/BotFather). Сборка на стороне клиента не требуется — бандлы в `dist/` готовы.
 
-## Тест (безопасно, без конфликта с боевым)
-Нужен ОТДЕЛЬНЫЙ тестовый бот-токен от @BotFather. Прогон:
-- `TELEGRAM_BOT_TOKEN=<test> TELEGRAM_STATE_DIR=/tmp/tg-test bun gateway/gateway.ts`
-- написать тестовому боту -> проверить файл в /tmp/tg-test/inbox
-- положить outbox/req-*.json с tool=reply -> проверить, что пришло в Telegram и появился outbox/res/<id>.json
+## Несколько ботов / воркспейсов
+Один бот = один демон = одна `TELEGRAM_STATE_DIR` = один токен. На Windows `install-windows.ps1` принимает `-StateDir` / `-TaskName` / `-LauncherName` — запусти его по разу на каждого бота. Плагин-мост и allowlist общие, ставятся один раз. Детали — в AGENTS.md (раздел Notes).
 
-## Открытый вопрос интеграции
-Как именно Claude Code `--channels` загружает локальный плагин-мост (через локальный marketplace или путь) — финально проверяется на cutover. Inbox-формат и имена тулов 1-в-1 с официальным, так что харнес должен подхватить без изменений.
+## Разработка
+Исходники — `gateway/gateway.ts` и `bridge/server.ts`. После правок пересобери бандлы: `bash scripts/build.sh` (нужен bun), затем закоммить `dist/`.

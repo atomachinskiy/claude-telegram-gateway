@@ -140,7 +140,7 @@ Create a command the user runs to start their bridged session (Variant 1 — the
 - If 3b succeeded (managed-settings): launch `claude --channels plugin:telegram@telegram-local`
 - If no admin (no 3b): launch `claude --dangerously-load-development-channels plugin:telegram@telegram-local` (Claude Code asks for consent ONCE per project, then remembers).
 
-- **Critical:** the launcher must export the SAME `TELEGRAM_STATE_DIR` the daemon uses (e.g. `~/.claude/channels/tg-gateway`) *before* invoking `claude`. The bridge defaults to a different dir (`telegram-claude5`) — without this it won't see the daemon's inbox/outbox and nothing flows.
+- **Critical:** the launcher must export the SAME `TELEGRAM_STATE_DIR` the daemon uses (e.g. `~/.claude/channels/tg-gateway`, or the per-bot dir) *before* invoking `claude`. If the daemon's state dir isn't the bridge's default, the bridge won't see its inbox/outbox and nothing flows.
 
 macOS/Linux — add a `claude-tg` function/alias to the shell rc (with `export TELEGRAM_STATE_DIR=…`). Windows — a `claude-tg.cmd` on PATH (with `set TELEGRAM_STATE_DIR=…`). Tell the user: **run `claude-tg` whenever you want to be reachable from Telegram, and keep that window open.**
 

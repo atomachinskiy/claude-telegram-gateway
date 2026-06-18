@@ -23,8 +23,8 @@ client.fallbackNotificationHandler = async (n: any) => {
 };
 
 const transport = new StdioClientTransport({
-  command: "/home/ubuntu/.bun/bin/bun",
-  args: ["/home/ubuntu/tg-gateway/bridge/server.ts"],
+  command: "node",
+  args: ["./bridge/dist/bridge.js"],
   env: { ...process.env, TELEGRAM_STATE_DIR: STATE },
   stderr: "inherit",
 });
