@@ -12,14 +12,12 @@ and is supervised so it restarts on crash/boot.
 
 > Execute the steps for the detected OS. Run commands one at a time, check each
 > result before moving on, and STOP and ask the user if anything is unexpected.
-> Lines marked **[VERIFY-PILOT]** are the cross-platform specifics least battle-
-> tested — double-check them on this first run and report back what actually worked.
 
 **Fast path:** a clone ships wrapper installers that do steps 1–3 for you —
 macOS `./install-mac.sh`, Windows `powershell -ExecutionPolicy Bypass -File .\install-windows.ps1`.
 They're idempotent and follow this runbook. Read the script for your OS, run it,
 then use section 4 to verify. The manual steps below are the source of truth if a
-script step misbehaves (it's the first pilot — expect to adjust the [VERIFY-PILOT] bits).
+script step misbehaves.
 
 ---
 
@@ -63,7 +61,7 @@ The daemon = `node $REPO/gateway/dist/gateway.js` with `TELEGRAM_STATE_DIR` set;
 it reads the rest from `$STATE/gateway.env`. Set it up so it starts on login and
 restarts on crash.
 
-### macOS — launchd  **[VERIFY-PILOT]**
+### macOS — launchd
 Write `~/Library/LaunchAgents/com.tg-gateway.plist`:
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -87,9 +85,9 @@ Replace `REPLACE_HOME` with `$HOME` (absolute). Then:
 launchctl unload ~/Library/LaunchAgents/com.tg-gateway.plist 2>/dev/null
 launchctl load  ~/Library/LaunchAgents/com.tg-gateway.plist
 ```
-Verify: `launchctl list | grep tg-gateway` shows it, and the log has `registered 7 bot commands`. Note: `node` must be on launchd's PATH; if not, use the absolute node path (`which node`) instead of `/usr/bin/env node`.
+Verify: `launchctl list | grep tg-gateway` shows it, and the log has `registered 8 bot commands`. Note: `node` must be on launchd's PATH; if not, use the absolute node path (`which node`) instead of `/usr/bin/env node`.
 
-### Windows — Scheduled Task  **[VERIFY-PILOT]**
+### Windows — Scheduled Task
 PowerShell (per-user; runs at logon, restarts on failure):
 ```powershell
 $node = (Get-Command node).Source
@@ -102,7 +100,7 @@ Register-ScheduledTask -TaskName "tg-gateway" -Action $action -Trigger $trigger 
 ```
 The task must pass `TELEGRAM_STATE_DIR` to the process. If env vars don't carry into the task, instead point the task at a tiny `.cmd` wrapper that does `set TELEGRAM_STATE_DIR=... & node "%gw%"`. Start it now: `Start-ScheduledTask -TaskName tg-gateway`.
 
-### Linux — systemd --user (reference; you said no Linux clients, kept for completeness)
+### Linux — systemd --user
 See `systemd/tg-gateway.service` in the repo; `Environment=TELEGRAM_STATE_DIR=...`, `Restart=always`, `loginctl enable-linger $USER`.
 
 ---
@@ -120,7 +118,7 @@ claude plugin enable  telegram@telegram-local
 claude plugin disable telegram@claude-plugins-official 2>/dev/null || true
 ```
 
-### 3b. Allowlist via managed-settings (admin/sudo) — preferred  **[VERIFY-PILOT]**
+### 3b. Allowlist via managed-settings (admin/sudo) — preferred
 Write this JSON to the OS managed-settings path and it loads with no dev prompt:
 ```json
 { "channelsEnabled": true,
@@ -148,7 +146,7 @@ macOS/Linux — add a `claude-tg` function/alias to the shell rc (with `export T
 
 ## 4. Verify end-to-end
 
-1. Daemon up: supervisor shows it running; `$STATE/gateway.status.json` updates; log has `registered 7 bot commands`.
+1. Daemon up: supervisor shows it running; `$STATE/gateway.status.json` updates; log has `registered 8 bot commands`.
 2. User runs `claude-tg` (a Claude Code session with the bridge).
 3. From Telegram, the user sends the bot a message → it should appear in the Claude Code session, and Claude's reply should arrive back in Telegram. The bot should also react (👀/etc.) and show "typing…".
 4. In Telegram type `/menu` — a control panel should appear (handled by the daemon).
@@ -170,4 +168,3 @@ If inbound messages don't reach the session: the allowlist isn't satisfied (revi
 - **Multiple bots / workspaces:** one bot = one daemon = one `TELEGRAM_STATE_DIR` = one token. Pair + supervise once per bot, each with a distinct state dir (e.g. `…/channels/tg-bot1`), token, and supervisor name (`tg-gateway-bot1`). The bridge plugin (`telegram-local`) and the managed-settings allowlist are **shared** — register them once. Differentiate sessions by exporting that bot's `TELEGRAM_STATE_DIR` in its own launcher (`claude-tg-bot1.cmd`), and run the matching launcher inside the matching workspace. On Windows, `install-windows.ps1` accepts `-StateDir`, `-TaskName`, `-LauncherName` for exactly this — run it once per bot.
 - All config is `$STATE/gateway.env` (written by pairing). To add another allowed chat later, append its id to `TELEGRAM_ALLOWED_CHATS` (comma-separated) and restart the daemon.
 - The slick session-control panel (`/restart`, `/model`, `/screen`, terminal-dialog relay) needs the daemon to manage the Claude session in tmux — that's a server/headless setup, **not** this bridge deployment. Here the daemon only transports; `/menu`/`/status`/`/ping` still work (daemon-handled), but `/restart`/`/model`/`/screen` are no-ops without a managed tmux session.
-- Report back which **[VERIFY-PILOT]** steps worked as written vs. needed adjustment, so this runbook can be hardened.
