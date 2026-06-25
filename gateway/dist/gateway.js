@@ -31,7 +31,7 @@ var CONFIG_ENV_FILE = process.env.TG_GATEWAY_ENV ?? join(STATE_DIR, "gateway.env
     }
   } catch {}
 })();
-var VERSION = "1.0.0";
+var VERSION = "1.1.0";
 var STALE_MS = 180000;
 var SYS_ADMINS = new Set((process.env.TELEGRAM_SYS_ADMINS ?? "").split(",").map((s) => s.trim()).filter(Boolean));
 var ALLOWED_CHATS = new Set([
@@ -366,6 +366,12 @@ async function handleUpdate(u) {
   }
   writeInbox(`${Date.now()}-${msg.message_id}.json`, base);
   LOG(`inbox <- chat ${base.chat_id} msg ${base.message_id} ${base.image_path ? "[photo]" : base.attachment_kind ? `[${base.attachment_kind}]${base.voice_transcribed ? "+stt" : ""}` : ""}`);
+  const down = brainDownNow();
+  if (down) {
+    const t = down === "auth" ? "\u26A0\uFE0F \u041F\u043E\u043B\u0443\u0447\u0438\u043B, \u043D\u043E Claude \u0441\u0435\u0439\u0447\u0430\u0441 \u0440\u0430\u0437\u043B\u043E\u0433\u0438\u043D\u0435\u043D (API 401) \u0438 \u043D\u0435 \u043E\u0431\u0440\u0430\u0431\u0430\u0442\u044B\u0432\u0430\u0435\u0442 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u044F. \u041D\u0443\u0436\u0435\u043D /login \u0432 \u0442\u0435\u0440\u043C\u0438\u043D\u0430\u043B\u0435 \u0438\u043B\u0438 /restart. \u041E\u0442\u0432\u0435\u0447\u0443, \u043A\u0430\u043A \u043F\u043E\u0447\u0438\u043D\u044E." : "\u26A0\uFE0F \u041F\u043E\u043B\u0443\u0447\u0438\u043B, \u043D\u043E \u0441\u0435\u0441\u0441\u0438\u044F Claude \u0441\u0435\u0439\u0447\u0430\u0441 \u043D\u0435 \u043D\u0430 \u0441\u0432\u044F\u0437\u0438. \u0416\u043C\u0438 /restart. \u0421\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435 \u0431\u0443\u0444\u0435\u0440\u0438\u0437\u0443\u0435\u0442\u0441\u044F \u0438 \u0434\u043E\u0435\u0434\u0435\u0442.";
+    sendReply({ chat_id: base.chat_id, text: t, reply_to: base.message_id }).catch(() => {});
+    LOG(`brain-down ack sent to chat ${base.chat_id} (${down})`);
+  }
 }
 function chunk(text, limit = 4000) {
   if (text.length <= limit)
@@ -903,6 +909,39 @@ function checkBrain() {
     tell("\uD83D\uDFE2 \u0421\u0435\u0441\u0441\u0438\u044F Claude \u0441\u043D\u043E\u0432\u0430 \u043D\u0430 \u0441\u0432\u044F\u0437\u0438 \u2014 heartbeat \u043F\u043E\u0448\u0451\u043B, \u0431\u044D\u043A\u043B\u043E\u0433 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0439 \u0434\u043E\u0435\u0437\u0436\u0430\u0435\u0442.");
   }
 }
+var AUTH_DOWN_RE = /Please run \/login|Invalid authentication credentials|API Error:\s*401|Credit balance is too low|OAuth token has expired/i;
+function detectAuthDown() {
+  return AUTH_DOWN_RE.test(paneTail(40));
+}
+var authWasDown = false;
+var authDownStreak = 0;
+function checkAuth() {
+  if (detectAuthDown())
+    authDownStreak++;
+  else
+    authDownStreak = 0;
+  const isDown = authDownStreak >= 2;
+  const tell = (t) => {
+    for (const a of SYS_ADMINS)
+      sendReply({ chat_id: a, text: t }).catch(() => {});
+  };
+  if (!authWasDown && isDown) {
+    authWasDown = true;
+    tell("\uD83D\uDD34 Claude \u0440\u0430\u0437\u043B\u043E\u0433\u0438\u043D\u0438\u043B\u0441\u044F \u2014 API 401. \u0421\u0435\u0441\u0441\u0438\u044F \u0436\u0438\u0432\u0430, \u043D\u043E \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u044F \u0421\u0415\u0419\u0427\u0410\u0421 \u041D\u0415 \u043E\u0431\u0440\u0430\u0431\u0430\u0442\u044B\u0432\u0430\u044E\u0442\u0441\u044F. \u0417\u0430\u043B\u043E\u0433\u0438\u043D\u044C \u0435\u0451 (/login \u0432 \u0442\u0435\u0440\u043C\u0438\u043D\u0430\u043B\u0435) \u0438\u043B\u0438 \u0436\u043C\u0438 /restart.");
+  } else if (authWasDown && authDownStreak === 0) {
+    authWasDown = false;
+    tell("\uD83D\uDFE2 \u0410\u0432\u0442\u043E\u0440\u0438\u0437\u0430\u0446\u0438\u044F Claude \u0432\u043E\u0441\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D\u0430 \u2014 \u0441\u043D\u043E\u0432\u0430 \u043D\u0430 \u0441\u0432\u044F\u0437\u0438, \u0431\u044D\u043A\u043B\u043E\u0433 \u0434\u043E\u0435\u0434\u0435\u0442.");
+  }
+}
+function brainDownNow() {
+  if (detectAuthDown())
+    return "auth";
+  let age = Infinity;
+  try {
+    age = Date.now() - statSync(BRIDGE_HEARTBEAT).mtimeMs;
+  } catch {}
+  return age >= BRAIN_STALE_MS ? "dead" : "";
+}
 function cleanupRes() {
   try {
     for (const f of readdirSync(OUTBOX_RES)) {
@@ -1002,6 +1041,7 @@ async function main() {
       process.exit(1);
     }
     checkBrain();
+    checkAuth();
     cleanupRes();
   }, 15000);
   while (running) {

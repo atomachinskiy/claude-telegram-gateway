@@ -34,7 +34,7 @@ const CONFIG_ENV_FILE = process.env.TG_GATEWAY_ENV ?? join(STATE_DIR, "gateway.e
     }
   } catch {}
 })();
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const STALE_MS = 180_000; // no successful poll in 3 min => wedged; exit so the supervisor restarts fresh
 // /sys + /menu control commands: who may run them, where the session lives, how to restart it.
 const SYS_ADMINS = new Set((process.env.TELEGRAM_SYS_ADMINS ?? "").split(",").map(s => s.trim()).filter(Boolean));
@@ -307,6 +307,17 @@ async function handleUpdate(u: any) {
   } catch (e: any) { LOG(`media handling error: ${e.message}`); base.text = base.text ?? "[media download failed]"; }
   writeInbox(`${Date.now()}-${msg.message_id}.json`, base);
   LOG(`inbox <- chat ${base.chat_id} msg ${base.message_id} ${base.image_path ? "[photo]" : base.attachment_kind ? `[${base.attachment_kind}]${base.voice_transcribed ? "+stt" : ""}` : ""}`);
+  // If the brain can't answer right now the sender would otherwise get total
+  // silence. Tell them immediately — the inbox entry above is still buffered and
+  // gets answered once the session recovers.
+  const down = brainDownNow();
+  if (down) {
+    const t = down === "auth"
+      ? "⚠️ Получил, но Claude сейчас разлогинен (API 401) и не обрабатывает сообщения. Нужен /login в терминале или /restart. Отвечу, как починю."
+      : "⚠️ Получил, но сессия Claude сейчас не на связи. Жми /restart. Сообщение буферизуется и доедет.";
+    sendReply({ chat_id: base.chat_id, text: t, reply_to: base.message_id }).catch(() => {});
+    LOG(`brain-down ack sent to chat ${base.chat_id} (${down})`);
+  }
 }
 
 // ---------- outgoing (chunk + markdownv2 fallback) ----------
@@ -737,6 +748,34 @@ function checkBrain() {
     tell("🟢 Сессия Claude снова на связи — heartbeat пошёл, бэклог сообщений доезжает.");
   }
 }
+// ---------- auth-down detector (401 / "Please run /login") ----------
+// The bridge heartbeat ticks on a 10s timer regardless of API auth, so a dead
+// token leaves the session "alive" by heartbeat while the brain can't answer at
+// all — invisible to checkBrain (message received, never answered, no alert).
+// The reliable signal is the on-screen TUI banner. Scrape the pane and alert on
+// the down/up edges only (no routine "all green" noise).
+const AUTH_DOWN_RE = /Please run \/login|Invalid authentication credentials|API Error:\s*401|Credit balance is too low|OAuth token has expired/i;
+function detectAuthDown(): boolean { return AUTH_DOWN_RE.test(paneTail(40)); }
+let authWasDown = false, authDownStreak = 0;
+function checkAuth() {
+  if (detectAuthDown()) authDownStreak++; else authDownStreak = 0;
+  const isDown = authDownStreak >= 2; // 2 consecutive ticks (~30s) confirm — kills transient redraws
+  const tell = (t: string) => { for (const a of SYS_ADMINS) sendReply({ chat_id: a, text: t }).catch(() => {}); };
+  if (!authWasDown && isDown) {
+    authWasDown = true;
+    tell("🔴 Claude разлогинился — API 401. Сессия жива, но сообщения СЕЙЧАС НЕ обрабатываются. Залогинь её (/login в терминале) или жми /restart.");
+  } else if (authWasDown && authDownStreak === 0) {
+    authWasDown = false;
+    tell("🟢 Авторизация Claude восстановлена — снова на связи, бэклог доедет.");
+  }
+}
+// Live reachability probe at message time — used to ack the sender immediately if
+// the brain can't answer right now (auth banner on screen, or heartbeat stale).
+function brainDownNow(): "" | "auth" | "dead" {
+  if (detectAuthDown()) return "auth";
+  let age = Infinity; try { age = Date.now() - statSync(BRIDGE_HEARTBEAT).mtimeMs; } catch {}
+  return age >= BRAIN_STALE_MS ? "dead" : "";
+}
 // Orphaned outbox results (bridge died mid-wait) otherwise pile up forever.
 function cleanupRes() {
   try {
@@ -794,6 +833,7 @@ async function main() {
     const age = Date.now() - new Date(status.lastPollOk).getTime();
     if (age > STALE_MS) { LOG(`FATAL: no successful poll in ${Math.round(age / 1000)}s — wedged. exiting for supervisor restart.`); releaseLock(); process.exit(1); }
     checkBrain();
+    checkAuth();
     cleanupRes();
   }, 15000);
   while (running) {
