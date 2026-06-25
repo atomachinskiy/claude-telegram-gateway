@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# tgw — minimal multi-instance helper for tg-gateway on a single machine.
+# One bot + one tmux Claude session per named instance, bound via STATE_DIR.
+# No build step, no deps beyond node/bun + tmux. macOS (launchd) + Linux (nohup).
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CHANNELS="$HOME/.claude/channels"
+LA="$HOME/Library/LaunchAgents"
+RUNTIME="$(command -v bun || command -v node || true)"
+[ -n "$RUNTIME" ] || { echo "tgw: need bun or node on PATH" >&2; exit 1; }
+if [[ "$RUNTIME" == *bun* ]]; then GW="$REPO/gateway/gateway.ts"; else GW="$REPO/gateway/dist/gateway.js"; fi
+CLAUDE_CHANNEL="claude --channels plugin:telegram@telegram-local"
+
+die(){ echo "tgw: $*" >&2; exit 1; }
+valid(){ [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$ ]] || die "bad name '$1' (use [a-z0-9-], 2-32 chars)"; }
+is_mac(){ [ "$(uname -s)" = "Darwin" ]; }
+launch_cmd(){ echo "TELEGRAM_STATE_DIR=$1 CLAUDE_TMUX=$2 $CLAUDE_CHANNEL"; }
+
+cmd_add(){
+  local name="${1:-}" token="${2:-}"; [ -n "$name" ] || die "usage: tgw add <name> <bot-token>"; valid "$name"
+  [ -n "$token" ] || die "usage: tgw add <name> <bot-token>"
+  local dir="$CHANNELS/$name"; mkdir -p "$dir"
+  printf 'TELEGRAM_BOT_TOKEN=%s\n' "$token" > "$dir/gateway.env"; chmod 600 "$dir/gateway.env"
+
+  echo "Open Telegram, message your bot /start to pair (waits up to 5 min)..."
+  TELEGRAM_BOT_TOKEN="$token" TELEGRAM_STATE_DIR="$dir" "$RUNTIME" "$GW" pair || die "pairing failed"
+
+  local restart="$dir/restart-$name.sh"
+  cat > "$restart" <<EOF
+#!/usr/bin/env bash
+tmux kill-session -t $name 2>/dev/null || true
+tmux new-session -d -s $name '$(launch_cmd "$dir" "$name")'
+EOF
+  chmod 700 "$restart"
+
+  if is_mac; then
+    mkdir -p "$LA"; local label="com.tg-gateway.$name" plist="$LA/com.tg-gateway.$name.plist"
+    cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key><array><string>$RUNTIME</string><string>$GW</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>TELEGRAM_STATE_DIR</key><string>$dir</string>
+    <key>CLAUDE_TMUX</key><string>$name</string>
+    <key>SYS_RESTART_CMD</key><string>$restart</string>
+    <key>PATH</key><string>$(dirname "$RUNTIME"):/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>$dir/daemon.log</string>
+  <key>StandardOutPath</key><string>$dir/daemon.log</string>
+</dict></plist>
+EOF
+    launchctl unload "$plist" 2>/dev/null || true
+    launchctl load -w "$plist"
+    echo "✓ added '$name' — daemon under LaunchAgent $label (24/7). Next: tgw up $name"
+  else
+    # Linux fallback: background the daemon (for the supervised server, use systemd instead).
+    TELEGRAM_STATE_DIR="$dir" CLAUDE_TMUX="$name" SYS_RESTART_CMD="$restart" \
+      nohup "$RUNTIME" "$GW" >>"$dir/daemon.log" 2>&1 &
+    echo "✓ added '$name' — daemon backgrounded (pid $!). Next: tgw up $name"
+  fi
+}
+
+cmd_up(){
+  local name="${1:-}"; [ -n "$name" ] || die "usage: tgw up <name>"; valid "$name"
+  local dir="$CHANNELS/$name"; [ -f "$dir/gateway.env" ] || die "no instance '$name' — run: tgw add $name <token>"
+  tmux has-session -t "$name" 2>/dev/null || tmux new-session -d -s "$name" "$(launch_cmd "$dir" "$name")"
+  tmux attach -t "$name"
+}
+
+cmd_list(){
+  [ -d "$CHANNELS" ] || { echo "(no instances)"; return; }
+  local found=0
+  for d in "$CHANNELS"/*/; do
+    [ -f "${d}gateway.env" ] || continue; found=1
+    local name; name="$(basename "$d")"
+    local sess="🔴"; tmux has-session -t "$name" 2>/dev/null && sess="🟢"
+    local dmn="🔴"; if is_mac; then launchctl list "com.tg-gateway.$name" >/dev/null 2>&1 && dmn="🟢"; else pgrep -f "TELEGRAM_STATE_DIR=$CHANNELS/$name " >/dev/null 2>&1 && dmn="🟢"; fi
+    printf '%-18s демон %s  сессия %s\n' "$name" "$dmn" "$sess"
+  done
+  [ "$found" = 1 ] || echo "(no instances)"
+}
+
+cmd_rm(){
+  local name="${1:-}"; [ -n "$name" ] || die "usage: tgw rm <name>"; valid "$name"
+  tmux kill-session -t "$name" 2>/dev/null || true
+  if is_mac; then launchctl unload -w "$LA/com.tg-gateway.$name.plist" 2>/dev/null || true; rm -f "$LA/com.tg-gateway.$name.plist"; fi
+  echo "✓ removed '$name' (state dir kept at $CHANNELS/$name — delete manually if you want)"
+}
+
+case "${1:-}" in
+  add)  shift; cmd_add "$@";;
+  up)   shift; cmd_up "$@";;
+  list) cmd_list;;
+  rm)   shift; cmd_rm "$@";;
+  *) echo "usage: tgw <add <name> <token> | up <name> | list | rm <name>>" >&2; exit 1;;
+esac
