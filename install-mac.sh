@@ -15,7 +15,7 @@ MS="/Library/Application Support/ClaudeCode/managed-settings.json"  # [VERIFY-PI
 say(){ printf '\033[1;36m▸ %s\033[0m\n' "$*"; }
 die(){ printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
-command -v node  >/dev/null || die "node not found — Claude Code needs it; install Node 18+ first."
+command -v node  >/dev/null || die "node not found — install Node.js 18+ first (nodejs.org pkg, or the official tarball into ~/.local/node)."
 command -v claude >/dev/null || die "claude (Claude Code) not found — set it up first."
 [ -f "$GW" ] || die "missing $GW — are you running this from the repo clone?"
 mkdir -p "$STATE" "$(dirname "$LAUNCHER")"

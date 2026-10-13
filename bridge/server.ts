@@ -59,9 +59,11 @@ const mcp = new Server(
     instructions: [
       "The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.",
       "",
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (a message_id) only when replying to an earlier message; for a normal reply to the latest message omit reply_to.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. If the tag has message_thread_id, the message came from a forum topic: pass that value back too, or your answer appears in General instead of the topic being read; the tag may also carry topic with the topic title. Use reply_to (a message_id) only when replying to an earlier message; for a normal reply to the latest message omit reply_to.',
       "",
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits do not trigger push notifications — when a long task completes, send a new reply so the user device pings.',
+      "",
+      'For a table or a structured report use format "rich": write plain GitHub-flavoured markdown (| tables, # headings, **bold**, lists, > quotes) with NO MarkdownV2 escaping — Telegram renders it natively as a rich message and it stays one message up to 32k chars. Ordinary replies keep format "markdownv2". If Telegram rejects the markdown, the gateway resends it as plain text, nothing is lost.',
       "",
       'For a single-choice question (the built-in question UI does not work over this channel), call the ask tool with chat_id, question, and options[]; it renders the options as inline buttons and BLOCKS until the user taps, returning {choice, index}. Use ask whenever you would otherwise ask a multiple-choice question.',
       "",
@@ -75,15 +77,16 @@ const mcp = new Server(
 const TOOLS = [
   {
     name: "reply",
-    description: "Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.",
+    description: "Reply on Telegram. Pass chat_id from the inbound message. In a forum supergroup ALSO pass message_thread_id back, otherwise the answer lands in General instead of the topic the person is reading. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.",
     inputSchema: {
       type: "object",
       properties: {
         chat_id: { type: "string" },
         text: { type: "string" },
+        message_thread_id: { type: "string", description: "Forum topic to answer into. Copy it from the inbound <channel> block whenever it is present; omit in ordinary chats." },
         reply_to: { type: "string", description: "Message ID to thread under. Use message_id from the inbound <channel> block." },
         files: { type: "array", items: { type: "string" }, description: "Absolute file paths to attach. Images send as photos (inline preview); other types as documents." },
-        format: { type: "string", enum: ["text", "markdownv2"], description: "Rendering mode. 'markdownv2' enables Telegram formatting; caller must escape special chars per MarkdownV2. Default 'text'." },
+        format: { type: "string", enum: ["text", "markdownv2", "rich"], description: "Rendering mode. 'markdownv2' enables Telegram formatting; caller must escape special chars per MarkdownV2. 'rich' sends a Bot API rich message: pass PLAIN GitHub-flavoured markdown with NO MarkdownV2 escaping (| tables, # headings, **bold**, - lists, > quotes, ``` code, <details>); Telegram renders tables natively and the whole reply fits one message (32k chars). Use 'rich' whenever the reply contains a table or is a structured report; keep 'markdownv2' for ordinary replies. If Telegram rejects the markdown the gateway resends it as plain text. Default 'text'." },
         disable_notification: { type: "boolean", description: "Send silently (no push). Use for interim progress; send a normal reply when the task completes so the device pings." },
         buttons: { type: "array", description: "Inline keyboard. One row [{...},{...}] or multiple rows [[...],[...]]. Each button is {text, data} (callback: the tap returns as a channel event with meta.callback_data and meta.is_callback) or {text, url} (opens a link). Keep data <=64 bytes. After the user taps, edit_message without buttons to drop the keyboard.", items: {} },
       },
@@ -120,6 +123,7 @@ const TOOLS = [
       type: "object",
       properties: {
         chat_id: { type: "string" },
+        message_thread_id: { type: "string", description: "Forum topic to ask in. Copy from the inbound <channel> block when present." },
         question: { type: "string", description: "The question text (escape per MarkdownV2 only if format=markdownv2)." },
         options: { type: "array", items: { type: "string" }, description: "2-10 short answer choices; each becomes a button." },
         format: { type: "string", enum: ["text", "markdownv2"] },
@@ -134,7 +138,7 @@ const TOOLS = [
       type: "object",
       properties: {
         chat_id: { type: "string" }, message_id: { type: "string" }, text: { type: "string" },
-        format: { type: "string", enum: ["text", "markdownv2"], description: "Rendering mode. 'markdownv2' enables Telegram formatting; caller must escape per MarkdownV2. Default 'text'." },
+        format: { type: "string", enum: ["text", "markdownv2", "rich"], description: "Rendering mode. 'markdownv2' enables Telegram formatting; caller must escape per MarkdownV2. 'rich' sends a Bot API rich message: pass PLAIN GitHub-flavoured markdown with NO MarkdownV2 escaping (| tables, # headings, **bold**, - lists, > quotes, ``` code, <details>); Telegram renders tables natively and the whole reply fits one message (32k chars). Use 'rich' whenever the reply contains a table or is a structured report; keep 'markdownv2' for ordinary replies. If Telegram rejects the markdown the gateway resends it as plain text. Default 'text'." },
         buttons: { type: "array", description: "Replace the inline keyboard. Omit to drop the keyboard (use after a button was tapped). Same shape as reply.buttons.", items: {} },
       },
       required: ["chat_id", "message_id", "text"],
@@ -169,6 +173,10 @@ function toMeta(o: any) {
   const m: any = { chat_id: o.chat_id, user: o.user, user_id: o.user_id, ts: o.ts };
   if (o.message_id != null) m.message_id = String(o.message_id);
   if (o.reply_to_message_id != null) m.reply_to_message_id = String(o.reply_to_message_id);
+  // Forum topic the message came from. Must be echoed back in reply, otherwise the
+  // answer lands in General instead of the topic the person is reading.
+  if (o.message_thread_id != null) m.message_thread_id = String(o.message_thread_id);
+  if (o.topic) m.topic = o.topic;
   if (o.is_callback) { m.is_callback = true; m.callback_data = o.callback_data ?? ""; if (o.callback_query_id) m.callback_query_id = String(o.callback_query_id); }
   if (o.image_path) m.image_path = o.image_path;
   if (o.attachment_file_id) {

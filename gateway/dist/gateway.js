@@ -4,7 +4,7 @@
 // gateway/gateway.ts
 import { homedir } from "os";
 import { join } from "path";
-import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, unlinkSync, renameSync, statSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, unlinkSync, renameSync, statSync, copyFileSync } from "fs";
 import { spawnSync } from "child_process";
 var STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), ".claude", "channels", "tg-gateway");
 var INBOX = join(STATE_DIR, "inbox");
@@ -31,22 +31,34 @@ var CONFIG_ENV_FILE = process.env.TG_GATEWAY_ENV ?? join(STATE_DIR, "gateway.env
     }
   } catch {}
 })();
-var VERSION = "1.1.0";
+var VERSION = "1.2.0";
 var STALE_MS = 180000;
 var SYS_ADMINS = new Set((process.env.TELEGRAM_SYS_ADMINS ?? "").split(",").map((s) => s.trim()).filter(Boolean));
 var ALLOWED_CHATS = new Set([
   ...(process.env.TELEGRAM_ALLOWED_CHATS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
   ...SYS_ADMINS
 ]);
-function isAllowedChat(chatId, userId) {
-  return ALLOWED_CHATS.has("*") || ALLOWED_CHATS.has(chatId) || SYS_ADMINS.has(userId);
+var ALLOWED_GROUP_USERS = new Set([
+  ...(process.env.TELEGRAM_ALLOWED_GROUP_USERS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+  ...SYS_ADMINS
+]);
+function isAllowedChat(chatId, userId, isGroup = false) {
+  if (ALLOWED_CHATS.has("*"))
+    return true;
+  if (isGroup)
+    return ALLOWED_CHATS.has(chatId) && ALLOWED_GROUP_USERS.has(userId);
+  return ALLOWED_CHATS.has(chatId) || SYS_ADMINS.has(userId);
 }
+var topicNames = new Map;
+var sysThread = new Map;
 var TMUX_SESSION = process.env.CLAUDE_TMUX ?? "claude";
+var SESSION_LABEL = process.env.TG_SESSION_LABEL ?? "Claude";
 var SYS_RESTART_CMD = process.env.SYS_RESTART_CMD ?? "";
 var BRIDGE_HEARTBEAT = join(STATE_DIR, "bridge.heartbeat");
 var ACK_EMOJI = process.env.TELEGRAM_ACK_EMOJI ?? "\uD83D\uDC40";
 var TYPING_MAX_MS = 8 * 60000;
 var typingChats = new Map;
+var typingKey = (chatId, threadId) => threadId ? `${chatId}:${threadId}` : String(chatId);
 var REACTION_RULES = [
   [/\u0441\u043F\u0430\u0441\u0438\u0431|(?<![\u0430-\u044F\u0451a-z])\u0441\u043F\u0441(?![\u0430-\u044F\u0451a-z])|\u0431\u043B\u0430\u0433\u043E\u0434\u0430\u0440|\u043C\u0435\u0440\u0441\u0438|\uD83D\uDE4F/i, "\uD83D\uDE4F"],
   [/(?<![\u0430-\u044F\u0451a-z])\u0443\u0440\u0430(?![\u0430-\u044F\u0451a-z])|\u043F\u043E\u0437\u0434\u0440\u0430\u0432|\uD83C\uDF89|\u0441 \u0434\u043D\u0451\u043C|\u0441 \u0434\u043D\u0435\u043C|\u043F\u0440\u0430\u0437\u0434/i, "\uD83C\uDF89"],
@@ -125,8 +137,9 @@ function loadToken() {
   process.exit(1);
 }
 var TOKEN = loadToken();
-var API = `https://api.telegram.org/bot${TOKEN}`;
-var FILE_API = `https://api.telegram.org/file/bot${TOKEN}`;
+var API_ROOT = (process.env.TELEGRAM_API_ROOT || "https://api.telegram.org").replace(/\/+$/, "");
+var API = `${API_ROOT}/bot${TOKEN}`;
+var FILE_API = `${API_ROOT}/file/bot${TOKEN}`;
 
 class TgError extends Error {
   status;
@@ -153,19 +166,31 @@ async function call(method, body, timeoutMs = 65000) {
     clearTimeout(t);
   }
 }
-function writeInbox(name, obj) {
-  const tmp = join(INBOX, `.${name}.tmp`);
+function writeInbox(name, obj, dir = INBOX) {
+  const tmp = join(dir, `.${name}.tmp`);
   writeFileSync(tmp, JSON.stringify(obj, null, 2));
-  renameSync(tmp, join(INBOX, name));
+  renameSync(tmp, join(dir, name));
+}
+var TOPIC_RUNTIME_CHATS = new Set((process.env.TELEGRAM_TOPIC_RUNTIME_CHATS ?? "").split(",").map((s) => s.trim()).filter(Boolean));
+var TOPICS_INBOX = join(STATE_DIR, "topics", "inbox");
+function inboxDirFor(chatId, threadId) {
+  if (threadId && TOPIC_RUNTIME_CHATS.has(chatId)) {
+    mkdirSync(TOPICS_INBOX, { recursive: true });
+    return TOPICS_INBOX;
+  }
+  return INBOX;
 }
 async function downloadFile(fileId, suggestExt) {
   const f = await call("getFile", { file_id: fileId });
   const path = f.file_path;
   const ext = suggestExt ?? (path.includes(".") ? path.split(".").pop() : "bin");
   const dest = join(INBOX, `${Date.now()}-${fileId}.${ext}`);
-  const resp = await fetch(`${FILE_API}/${path}`);
-  const buf = Buffer.from(await resp.arrayBuffer());
-  writeFileSync(dest, buf);
+  if (path.startsWith("/")) {
+    copyFileSync(path, dest);
+  } else {
+    const resp = await fetch(`${FILE_API}/${path}`);
+    writeFileSync(dest, Buffer.from(await resp.arrayBuffer()));
+  }
   return dest;
 }
 var GROQ_TOKEN_FILE = join(homedir(), ".claude", "secrets", "groq-token");
@@ -257,13 +282,18 @@ async function handleCallback(cq) {
       return void sysMcp(chat_id);
     if (rest.startsWith("model:"))
       return void sysSetModel(chat_id, rest.slice(6), messageId);
+    if (rest === "efforts")
+      return void sysEfforts(chat_id);
+    if (rest.startsWith("effort:"))
+      return void sysSetEffort(chat_id, rest.slice(7), messageId);
     if (rest.startsWith("tui:"))
       return void sysTuiKey(chat_id, rest.slice(4), messageId);
     return;
   }
   const from = cq.from ?? {};
   const msg = cq.message ?? {};
-  if (!isAllowedChat(String(msg.chat?.id ?? from.id ?? ""), String(from.id ?? ""))) {
+  const cbIsGroup = msg.chat?.type === "group" || msg.chat?.type === "supergroup";
+  if (!isAllowedChat(String(msg.chat?.id ?? from.id ?? ""), String(from.id ?? ""), cbIsGroup)) {
     try {
       await call("answerCallbackQuery", { callback_query_id: cq.id });
     } catch {}
@@ -291,7 +321,15 @@ async function handleCallback(cq) {
     text: label,
     callback_data: data
   };
-  writeInbox(`${Date.now()}-cbm-${cq.id}.json`, base);
+  let cbThread = "";
+  if (msg.chat?.is_forum && msg.is_topic_message && msg.message_thread_id != null) {
+    cbThread = String(msg.message_thread_id);
+    base.message_thread_id = cbThread;
+    const title = topicNames.get(`${chatId}:${msg.message_thread_id}`);
+    if (title)
+      base.topic = title;
+  }
+  writeInbox(`${Date.now()}-cbm-${cq.id}.json`, base, inboxDirFor(chatId, cbThread));
   LOG(`inbox <- button-tap chat ${chatId} data="${data}" label="${label}"`);
 }
 async function handleUpdate(u) {
@@ -302,28 +340,48 @@ async function handleUpdate(u) {
     return;
   const from = msg.from ?? {};
   const gateChat = String(msg.chat.id), gateUser = String(from.id ?? "");
-  if (!isAllowedChat(gateChat, gateUser)) {
+  const isGroup = msg.chat?.type === "group" || msg.chat?.type === "supergroup";
+  const isForum = msg.chat?.is_forum === true;
+  const threadId = isForum && msg.is_topic_message && msg.message_thread_id != null ? String(msg.message_thread_id) : "";
+  const tKey = typingKey(gateChat, threadId);
+  if (msg.forum_topic_created?.name)
+    topicNames.set(`${gateChat}:${msg.message_thread_id}`, msg.forum_topic_created.name);
+  if (msg.forum_topic_edited?.name)
+    topicNames.set(`${gateChat}:${msg.message_thread_id}`, msg.forum_topic_edited.name);
+  if (msg.forum_topic_created || msg.forum_topic_edited || msg.forum_topic_closed || msg.forum_topic_reopened || msg.new_chat_members || msg.left_chat_member)
+    return;
+  if (!isAllowedChat(gateChat, gateUser, isGroup)) {
     LOG(`DROP non-allowed chat ${gateChat} user ${gateUser} (@${from.username ?? "?"}): ${(msg.text ?? "[media]").slice(0, 80)}`);
     return;
   }
-  const text0 = (msg.text ?? "").trim();
-  if (/^\/(sys|menu|ping|status|restart|screen|logs|model|models|mcp)\b/i.test(text0)) {
+  const text0 = (msg.text ?? "").trim().replace(/^(\/[a-z_]+)@[A-Za-z0-9_]+/i, "$1");
+  if (/^\/(sys|menu|ping|status|restart|screen|logs|model|models|effort|mcp)\b/i.test(text0)) {
     if (!SYS_ADMINS.has(String(from.id ?? ""))) {
-      await call("sendMessage", { chat_id: String(msg.chat.id), text: "\u26D4 \u041A\u043E\u043C\u0430\u043D\u0434\u044B \u0443\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0438\u044F \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u044B \u0442\u043E\u043B\u044C\u043A\u043E \u0432\u043B\u0430\u0434\u0435\u043B\u044C\u0446\u0443." }).catch(() => {});
+      await call("sendMessage", { chat_id: gateChat, ...threadId ? { message_thread_id: Number(threadId) } : {}, text: "\u26D4 \u041A\u043E\u043C\u0430\u043D\u0434\u044B \u0443\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0438\u044F \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u044B \u0442\u043E\u043B\u044C\u043A\u043E \u0432\u043B\u0430\u0434\u0435\u043B\u044C\u0446\u0443." }).catch(() => {});
       return;
     }
-    return void handleSysCommand(String(msg.chat.id), text0).catch((e) => LOG(`sys cmd error: ${e.message}`));
+    if (threadId)
+      sysThread.set(gateChat, threadId);
+    else
+      sysThread.delete(gateChat);
+    return void handleSysCommand(gateChat, text0).catch((e) => LOG(`sys cmd error: ${e.message}`)).finally(() => sysThread.delete(gateChat));
   }
-  call("setMessageReaction", { chat_id: String(msg.chat.id), message_id: Number(msg.message_id), reaction: [{ type: "emoji", emoji: pickReaction(msg.text ?? msg.caption ?? "") }] }).catch(() => {});
-  call("sendChatAction", { chat_id: String(msg.chat.id), action: "typing" }).catch(() => {});
-  typingChats.set(String(msg.chat.id), Date.now());
+  call("setMessageReaction", { chat_id: gateChat, message_id: Number(msg.message_id), reaction: [{ type: "emoji", emoji: pickReaction(msg.text ?? msg.caption ?? "") }] }).catch(() => {});
+  call("sendChatAction", { chat_id: gateChat, ...threadId ? { message_thread_id: Number(threadId) } : {}, action: "typing" }).catch(() => {});
+  typingChats.set(tKey, Date.now());
   const base = {
-    chat_id: String(msg.chat.id),
+    chat_id: gateChat,
     message_id: String(msg.message_id),
     user: from.username ?? `${from.first_name ?? "user"}`,
     user_id: String(from.id ?? msg.chat.id),
     ts: new Date((msg.date ?? Date.now() / 1000) * 1000).toISOString()
   };
+  if (threadId) {
+    base.message_thread_id = threadId;
+    const title = topicNames.get(`${gateChat}:${threadId}`);
+    if (title)
+      base.topic = title;
+  }
   if (msg.reply_to_message)
     base.reply_to_message_id = String(msg.reply_to_message.message_id);
   try {
@@ -346,15 +404,20 @@ async function handleUpdate(u) {
       base.text = msg.caption ?? "";
       base.attachment_file_id = msg.audio.file_id;
       base.attachment_kind = "audio";
+      base.attachment_mime = msg.audio.mime_type;
+      base.attachment_size = msg.audio.file_size;
     } else if (msg.document) {
       base.text = msg.caption ?? "";
       base.attachment_file_id = msg.document.file_id;
       base.attachment_kind = "document";
       base.attachment_mime = msg.document.mime_type;
+      base.attachment_size = msg.document.file_size;
     } else if (msg.video) {
       base.text = msg.caption ?? "";
       base.attachment_file_id = msg.video.file_id;
       base.attachment_kind = "video";
+      base.attachment_mime = msg.video.mime_type;
+      base.attachment_size = msg.video.file_size;
     } else if (msg.text) {
       base.text = msg.text;
     } else {
@@ -364,9 +427,18 @@ async function handleUpdate(u) {
     LOG(`media handling error: ${e.message}`);
     base.text = base.text ?? "[media download failed]";
   }
-  writeInbox(`${Date.now()}-${msg.message_id}.json`, base);
-  LOG(`inbox <- chat ${base.chat_id} msg ${base.message_id} ${base.image_path ? "[photo]" : base.attachment_kind ? `[${base.attachment_kind}]${base.voice_transcribed ? "+stt" : ""}` : ""}`);
-  const down = brainDownNow();
+  const TG_DL_LIMIT = Number(process.env.TELEGRAM_DL_LIMIT_MB || 20) * 1024 * 1024;
+  if (base.attachment_kind && !base.image_path && !base.voice_transcribed && typeof base.attachment_size === "number" && base.attachment_size > TG_DL_LIMIT) {
+    const mb = Math.round(base.attachment_size / 1048576);
+    sendReply({ chat_id: base.chat_id, text: `\u26A0\uFE0F \u0424\u0430\u0439\u043B \u0441\u043B\u0438\u0448\u043A\u043E\u043C \u0431\u043E\u043B\u044C\u0448\u043E\u0439 (${mb} \u041C\u0411). \u041A\u0430\u043A \u0431\u043E\u0442 \u044F \u043C\u043E\u0433\u0443 \u0437\u0430\u0431\u0438\u0440\u0430\u0442\u044C \u0438\u0437 Telegram \u0442\u043E\u043B\u044C\u043A\u043E \u0444\u0430\u0439\u043B\u044B \u0434\u043E 20 \u041C\u0411. \u041F\u0440\u0438\u0448\u043B\u0438 \u0437\u0430\u043F\u0438\u0441\u044C \u0433\u043E\u043B\u043E\u0441\u043E\u0432\u044B\u043C \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435\u043C (\u043E\u043D\u043E \u0441\u0436\u0430\u0442\u043E \u0438 \u043E\u0431\u044B\u0447\u043D\u043E \u0432\u043B\u0435\u0437\u0430\u0435\u0442), \u0441\u0441\u044B\u043B\u043A\u043E\u0439 \u043D\u0430 \u0444\u0430\u0439\u043B, \u0438\u043B\u0438 \u0441\u043E\u0436\u043C\u0438/\u0440\u0430\u0437\u0440\u0435\u0436\u044C \u0435\u0433\u043E, \u0442\u043E\u0433\u0434\u0430 \u043E\u0431\u0440\u0430\u0431\u043E\u0442\u0430\u044E.`, reply_to: base.message_id }).catch(() => {});
+    base.text = `${base.text ? base.text + " " : ""}[\u0412\u043B\u043E\u0436\u0435\u043D\u0438\u0435 "${base.attachment_kind}" ${mb} \u041C\u0411 \u041D\u0415 \u0441\u043A\u0430\u0447\u0430\u043D\u043E: \u043F\u0440\u0435\u0432\u044B\u0448\u0435\u043D \u043B\u0438\u043C\u0438\u0442 Telegram Bot API 20 \u041C\u0411. \u041F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u0442\u0435\u043B\u044E \u0443\u0436\u0435 \u043E\u0442\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u043E \u0443\u0432\u0435\u0434\u043E\u043C\u043B\u0435\u043D\u0438\u0435 \u0441 \u043F\u0440\u043E\u0441\u044C\u0431\u043E\u0439 \u043F\u0440\u0438\u0441\u043B\u0430\u0442\u044C \u0433\u043E\u043B\u043E\u0441\u043E\u0432\u044B\u043C/\u0441\u0441\u044B\u043B\u043A\u043E\u0439/\u0441\u0436\u0430\u0442\u044C. \u041D\u0435 \u043F\u044B\u0442\u0430\u0439\u0441\u044F \u0441\u043A\u0430\u0447\u0438\u0432\u0430\u0442\u044C \u044D\u0442\u043E \u0432\u043B\u043E\u0436\u0435\u043D\u0438\u0435.]`;
+    delete base.attachment_file_id;
+    LOG(`oversized ${base.attachment_kind} ${mb}MB from chat ${base.chat_id}: user notified`);
+  }
+  const dir = inboxDirFor(base.chat_id, threadId);
+  writeInbox(`${Date.now()}-${msg.message_id}.json`, base, dir);
+  LOG(`inbox${dir === INBOX ? "" : "(\u0442\u0435\u043C\u0430)"} <- chat ${base.chat_id}${threadId ? ` \u0442\u0435\u043C\u0430 ${threadId}` : ""} msg ${base.message_id} ${base.image_path ? "[photo]" : base.attachment_kind ? `[${base.attachment_kind}]${base.voice_transcribed ? "+stt" : ""}` : ""}`);
+  const down = dir === INBOX ? brainDownNow() : null;
   if (down) {
     const t = down === "auth" ? "\u26A0\uFE0F \u041F\u043E\u043B\u0443\u0447\u0438\u043B, \u043D\u043E Claude \u0441\u0435\u0439\u0447\u0430\u0441 \u0440\u0430\u0437\u043B\u043E\u0433\u0438\u043D\u0435\u043D (API 401) \u0438 \u043D\u0435 \u043E\u0431\u0440\u0430\u0431\u0430\u0442\u044B\u0432\u0430\u0435\u0442 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u044F. \u041D\u0443\u0436\u0435\u043D /login \u0432 \u0442\u0435\u0440\u043C\u0438\u043D\u0430\u043B\u0435 \u0438\u043B\u0438 /restart. \u041E\u0442\u0432\u0435\u0447\u0443, \u043A\u0430\u043A \u043F\u043E\u0447\u0438\u043D\u044E." : "\u26A0\uFE0F \u041F\u043E\u043B\u0443\u0447\u0438\u043B, \u043D\u043E \u0441\u0435\u0441\u0441\u0438\u044F Claude \u0441\u0435\u0439\u0447\u0430\u0441 \u043D\u0435 \u043D\u0430 \u0441\u0432\u044F\u0437\u0438. \u0416\u043C\u0438 /restart. \u0421\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0435 \u0431\u0443\u0444\u0435\u0440\u0438\u0437\u0443\u0435\u0442\u0441\u044F \u0438 \u0434\u043E\u0435\u0434\u0435\u0442.";
     sendReply({ chat_id: base.chat_id, text: t, reply_to: base.message_id }).catch(() => {});
@@ -412,11 +484,103 @@ function unescapeMd(s) {
   }
   return out.replace(/\\([_*\[\]()~`>#+\-=|{}.!])/g, "$1");
 }
+var RICH_MAX_CHARS = 32768;
+var richDisabled = false;
+var RICH_SPACER = "\u2800";
+var RICH_BREATHES = /^(?:#{1,6}\s|>|\||```|~~~|(?:-{3,}|\*{3,}|_{3,})\s*$)/;
+var RICH_LIST_ITEM = /^\s{0,3}(?:[-*+]\s|\d+[.)]\s)/;
+function richSpacing(md) {
+  const lines = md.split(`
+`);
+  const out = [];
+  let fence = null;
+  for (let i = 0;i < lines.length; i++) {
+    const line = lines[i];
+    const fenceMark = line.match(/^\s{0,3}(```+|~~~+)/);
+    if (fenceMark)
+      fence = fence && line.trim().startsWith(fence) ? null : fence ?? fenceMark[1];
+    out.push(line);
+    if (fence || line.trim() !== "")
+      continue;
+    let j = i + 1;
+    while (j < lines.length && lines[j].trim() === "")
+      j++;
+    if (j >= lines.length) {
+      for (let x = i + 1;x < j; x++)
+        out.push(lines[x]);
+      break;
+    }
+    const next = lines[j];
+    let k = out.length - 2;
+    while (k >= 0 && out[k].trim() === "")
+      k--;
+    const prev = k >= 0 ? out[k] : "";
+    const bothList = RICH_LIST_ITEM.test(prev) && RICH_LIST_ITEM.test(next);
+    if (!bothList && !RICH_BREATHES.test(prev.trim()) && !RICH_BREATHES.test(next.trim())) {
+      out.push(RICH_SPACER, "");
+    }
+    for (let x = i + 1;x < j; x++)
+      out.push(lines[x]);
+    i = j - 1;
+  }
+  return out.join(`
+`);
+}
+function richPayload(text) {
+  return { markdown: richSpacing(text) };
+}
+function isRichCapabilityError(e) {
+  return e?.status === 404 || /method not found|unknown method|not implemented/i.test(String(e?.message ?? ""));
+}
+function richToPlain(md) {
+  return md.replace(/^\s{0,3}#{1,6}\s+/gm, "").replace(/(\*\*|__)([^\n]*?)\1/g, "$2").replace(/^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$/gm, "").replace(/^\s*\|(.+)\|\s*$/gm, (_m, row) => row.split("|").map((c) => c.trim()).filter(Boolean).join(" \xB7 ")).replace(/\n{3,}/g, `
+
+`).trim();
+}
+async function trySendRich(args, reply_markup) {
+  const { chat_id, text, reply_to, disable_notification } = args;
+  if (richDisabled || !text || text.length > RICH_MAX_CHARS)
+    return null;
+  const body = { chat_id, rich_message: richPayload(text) };
+  if (args.message_thread_id)
+    body.message_thread_id = Number(args.message_thread_id);
+  if (disable_notification)
+    body.disable_notification = true;
+  if (reply_markup)
+    body.reply_markup = reply_markup;
+  if (reply_to)
+    body.reply_parameters = { message_id: Number(reply_to) };
+  try {
+    const res = await call("sendRichMessage", body);
+    return { message_ids: [res.message_id] };
+  } catch (e) {
+    if (isRichCapabilityError(e)) {
+      richDisabled = true;
+      LOG(`rich: server has no sendRichMessage (${e.message}) \u2014 rich off until restart`);
+    } else
+      LOG(`rich: sendRichMessage rejected (${e.message}) \u2014 plain fallback`);
+    return null;
+  }
+}
 async function sendReply(args) {
   const { chat_id, text, format, reply_to, files, disable_notification } = args;
-  typingChats.delete(String(chat_id));
+  const thread = args.message_thread_id ?? sysThread.get(String(chat_id)) ?? "";
+  const threadArg = thread ? { message_thread_id: Number(thread) } : {};
+  typingChats.delete(typingKey(String(chat_id), thread ? String(thread) : undefined));
   const parse_mode = format === "markdownv2" ? "MarkdownV2" : undefined;
   const reply_markup = normalizeButtons(args.buttons);
+  if (format === "rich") {
+    const pre = [];
+    if (files && files.length) {
+      const f = await sendReply({ chat_id, files, text: "", disable_notification: true, message_thread_id: args.message_thread_id });
+      pre.push(...f.message_ids ?? []);
+    }
+    const rich = await trySendRich({ ...args, files: undefined }, reply_markup);
+    if (rich)
+      return { message_ids: [...pre, ...rich.message_ids] };
+    const plain = await sendReply({ ...args, files: undefined, format: "text", text: richToPlain(text ?? "") });
+    return { message_ids: [...pre, ...plain.message_ids ?? []] };
+  }
   const ids = [];
   if (files && files.length) {
     const CAPTION_LIMIT = 1024;
@@ -438,6 +602,8 @@ async function sendReply(args) {
       const attempt = async (method, field, cap2, pm) => {
         const fd = new FormData;
         fd.append("chat_id", String(chat_id));
+        if (thread)
+          fd.append("message_thread_id", String(thread));
         fd.append("caption", cap2);
         if (pm)
           fd.append("parse_mode", pm);
@@ -461,7 +627,7 @@ async function sendReply(args) {
         LOG(`send file failed (${name}): ${j.description}`);
     }
     if (rest) {
-      const tail = await sendReply({ chat_id, text: rest, format, disable_notification, buttons: args.buttons });
+      const tail = await sendReply({ chat_id, text: rest, format, disable_notification, buttons: args.buttons, message_thread_id: thread || undefined });
       ids.push(...tail.message_ids ?? []);
     }
     return { message_ids: ids };
@@ -470,7 +636,7 @@ async function sendReply(args) {
   for (let i = 0;i < parts.length; i++) {
     const quiet = disable_notification || i < parts.length - 1;
     const last = i === parts.length - 1;
-    const body = { chat_id, text: parts[i] };
+    const body = { chat_id, text: parts[i], ...threadArg };
     if (parse_mode)
       body.parse_mode = parse_mode;
     if (quiet)
@@ -484,7 +650,7 @@ async function sendReply(args) {
       ids.push(res.message_id);
     } catch (e) {
       if (parse_mode) {
-        const res = await call("sendMessage", { chat_id, text: unescapeMd(parts[i]), ...quiet ? { disable_notification: true } : {}, ...reply_markup && last ? { reply_markup } : {}, ...reply_to && i === 0 ? { reply_to_message_id: reply_to } : {} });
+        const res = await call("sendMessage", { chat_id, text: unescapeMd(parts[i]), ...threadArg, ...quiet ? { disable_notification: true } : {}, ...reply_markup && last ? { reply_markup } : {}, ...reply_to && i === 0 ? { reply_to_message_id: reply_to } : {} });
         ids.push(res.message_id);
       } else
         throw e;
@@ -505,6 +671,21 @@ async function execTool(tool, args) {
       const rm = normalizeButtons(args.buttons);
       if (rm)
         body.reply_markup = rm;
+      if (args.format === "rich" && !richDisabled) {
+        const rb = { chat_id: args.chat_id, message_id: Number(args.message_id), rich_message: richPayload(args.text) };
+        if (rm)
+          rb.reply_markup = rm;
+        try {
+          return await call("editMessageText", rb);
+        } catch (e) {
+          if (isRichCapabilityError(e))
+            richDisabled = true;
+          if (/not modified/i.test(String(e.message)))
+            return true;
+          LOG(`rich: edit rejected (${e.message}) \u2014 plain edit`);
+          body.text = richToPlain(args.text);
+        }
+      }
       try {
         return await call("editMessageText", body);
       } catch (e) {
@@ -539,7 +720,7 @@ async function startAsk(reqId, args) {
     return;
   }
   const buttons = options.map((o, i) => [{ text: o, data: `ask:${reqId}:${i}` }]);
-  const sent = await sendReply({ chat_id, text: question, format: args.format, buttons });
+  const sent = await sendReply({ chat_id, text: question, format: args.format, buttons, message_thread_id: args.message_thread_id });
   const messageId = sent.message_ids[sent.message_ids.length - 1];
   const timer = setTimeout(() => resolveAsk(reqId, -1, "timeout"), ASK_TIMEOUT_MS);
   pendingAsks.set(reqId, { chat_id, options, messageId, timer });
@@ -590,11 +771,12 @@ function lastPollAgo() {
   return status.lastPollOk ? Math.round((Date.now() - new Date(status.lastPollOk).getTime()) / 1000) : -1;
 }
 function sysMenu(chat_id) {
-  return sendReply({ chat_id, text: "\uD83C\uDF9B \u041F\u0430\u043D\u0435\u043B\u044C \u0443\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0438\u044F Claude", buttons: [
+  return sendReply({ chat_id, text: `\uD83C\uDF9B \u041F\u0430\u043D\u0435\u043B\u044C \u0443\u043F\u0440\u0430\u0432\u043B\u0435\u043D\u0438\u044F ${SESSION_LABEL}`, buttons: [
     [{ text: "\uD83D\uDCCA \u0421\u0442\u0430\u0442\u0443\u0441", data: "sys:status" }, { text: "\uD83D\uDD04 \u0420\u0435\u0441\u0442\u0430\u0440\u0442", data: "sys:restart" }],
     [{ text: "\uD83D\uDCDC \u041B\u043E\u0433\u0438", data: "sys:logs" }, { text: "\uD83D\uDDA5 \u042D\u043A\u0440\u0430\u043D", data: "sys:screen" }],
     [{ text: "\uD83D\uDDDC /compact", data: "sys:cc:/compact" }, { text: "\uD83E\uDDF9 /clear", data: "sys:cc:/clear" }],
-    [{ text: "\uD83E\uDDE0 \u041C\u043E\u0434\u0435\u043B\u044C", data: "sys:models" }, { text: "\uD83D\uDD0C MCP", data: "sys:mcp" }]
+    [{ text: "\uD83E\uDDE0 \u041C\u043E\u0434\u0435\u043B\u044C", data: "sys:models" }, { text: "\u26A1 Effort", data: "sys:efforts" }],
+    [{ text: "\uD83D\uDD0C MCP", data: "sys:mcp" }]
   ] });
 }
 async function sysStatus(chat_id) {
@@ -628,17 +810,17 @@ function sysLogs(chat_id) {
 function sysScreen(chat_id) {
   const c = sh(["tmux", "capture-pane", "-t", TMUX_SESSION, "-p"]);
   if (!c.ok)
-    return sendReply({ chat_id, text: `\uD83D\uDDA5 \u042D\u043A\u0440\u0430\u043D \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D: ${c.out || "\u043D\u0435\u0442 \u0441\u0435\u0441\u0441\u0438\u0438 " + TMUX_SESSION}` });
+    return sendReply({ chat_id, text: `\uD83D\uDDA5 \u042D\u043A\u0440\u0430\u043D \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D: ${c.out || "\u043D\u0435\u0442 \u0441\u0435\u0441\u0441\u0438\u0438 " + SESSION_LABEL}` });
   const out = c.out.split(`
 `).filter((l) => l.trim()).slice(-40).join(`
 `).slice(-3500);
-  return sendReply({ chat_id, text: `\uD83D\uDDA5 \u042D\u043A\u0440\u0430\u043D Claude:
+  return sendReply({ chat_id, text: `\uD83D\uDDA5 \u042D\u043A\u0440\u0430\u043D ${SESSION_LABEL}:
 
 ` + (out || "(\u043F\u0443\u0441\u0442\u043E)") });
 }
 async function sysMcp(chat_id) {
   if (!sh(["tmux", "has-session", "-t", TMUX_SESSION]).ok)
-    return sendReply({ chat_id, text: `\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F ${TMUX_SESSION} \u043D\u0435 \u0437\u0430\u043F\u0443\u0449\u0435\u043D\u0430 \u2014 \u043F\u0430\u043D\u0435\u043B\u044C /mcp \u043F\u043E\u043A\u0430\u0437\u044B\u0432\u0430\u0442\u044C \u043D\u0435\u0433\u0434\u0435.` });
+    return sendReply({ chat_id, text: `\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F ${SESSION_LABEL} \u043D\u0435 \u0437\u0430\u043F\u0443\u0449\u0435\u043D\u0430 \u2014 \u043F\u0430\u043D\u0435\u043B\u044C /mcp \u043F\u043E\u043A\u0430\u0437\u044B\u0432\u0430\u0442\u044C \u043D\u0435\u0433\u0434\u0435.` });
   sh(["tmux", "send-keys", "-t", TMUX_SESSION, "-l", "/mcp"]);
   sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"]);
   await sleep(2000);
@@ -658,7 +840,7 @@ async function sysSendKeys(chat_id, keys) {
   if (!keys)
     return sendReply({ chat_id, text: "\u0424\u043E\u0440\u043C\u0430\u0442: /sys cc <\u043A\u043E\u043C\u0430\u043D\u0434\u0430>, \u043D\u0430\u043F\u0440. /sys cc /compact" });
   if (!sh(["tmux", "has-session", "-t", TMUX_SESSION]).ok)
-    return sendReply({ chat_id, text: `\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F ${TMUX_SESSION} \u043D\u0435 \u0437\u0430\u043F\u0443\u0449\u0435\u043D\u0430 - \u043A\u043E\u043C\u0430\u043D\u0434\u0443 \u043D\u0435\u043A\u0443\u0434\u0430 \u0441\u043B\u0430\u0442\u044C.` });
+    return sendReply({ chat_id, text: `\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F ${SESSION_LABEL} \u043D\u0435 \u0437\u0430\u043F\u0443\u0449\u0435\u043D\u0430 - \u043A\u043E\u043C\u0430\u043D\u0434\u0443 \u043D\u0435\u043A\u0443\u0434\u0430 \u0441\u043B\u0430\u0442\u044C.` });
   const r1 = sh(["tmux", "send-keys", "-t", TMUX_SESSION, "-l", keys]);
   const r2 = sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"]);
   if (!r1.ok || !r2.ok)
@@ -668,28 +850,85 @@ async function sysSendKeys(chat_id, keys) {
   const out = cap.ok ? cap.out.split(`
 `).filter((l) => l.trim()).slice(-30).join(`
 `).slice(-3000) : "(\u044D\u043A\u0440\u0430\u043D \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D)";
-  return sendReply({ chat_id, text: `\u2328\uFE0F \u041E\u0442\u043F\u0440\u0430\u0432\u0438\u043B \u0432 Claude: ${keys}
+  return sendReply({ chat_id, text: `\u2328\uFE0F \u041E\u0442\u043F\u0440\u0430\u0432\u0438\u043B \u0432 ${SESSION_LABEL}: ${keys}
 
 \uD83D\uDDA5 \u042D\u043A\u0440\u0430\u043D:
 ${out}` });
 }
-var MODELS = [
-  { label: "Opus 4.8 (1M)", id: "claude-opus-4-8[1m]" },
-  { label: "Opus 4.8", id: "claude-opus-4-8" },
-  { label: "Sonnet 4.6", id: "claude-sonnet-4-6" },
-  { label: "Haiku 4.5", id: "claude-haiku-4-5-20251001" },
-  { label: "Fable 5", id: "claude-fable-5" }
+var MODELS_1M = (process.env.TG_MODELS_1M ?? "1") !== "0";
+var MODELS_FALLBACK = [
+  { label: "Opus 5", id: "claude-opus-5" },
+  { label: "Sonnet 5", id: "claude-sonnet-5" },
+  { label: "Fable 5", id: "claude-fable-5" },
+  { label: "Haiku 4.5", id: "claude-haiku-4-5-20251001" }
 ];
-function sysModels(chat_id) {
-  const buttons = MODELS.map((m, i) => [{ text: m.label, data: `sys:model:${i}` }]);
-  return sendReply({ chat_id, text: "\uD83E\uDDE0 \u0412\u044B\u0431\u0435\u0440\u0438 \u043C\u043E\u0434\u0435\u043B\u044C (\u043F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \u043D\u0430 \u043B\u0435\u0442\u0443, \u0431\u0435\u0437 \u0440\u0435\u0441\u0442\u0430\u0440\u0442\u0430):", buttons });
+var MODELS_TTL_MS = 30 * 60 * 1000;
+var MODELS_MAX = 8;
+var MODELS_URL = process.env.CLAUDE_MODELS_URL ?? "https://api.anthropic.com/v1/models?limit=100";
+var modelsCache = [];
+var modelsCacheAt = 0;
+function oauthToken() {
+  const fromEnv = process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim();
+  if (fromEnv)
+    return fromEnv;
+  try {
+    return readFileSync(join(homedir(), ".claude", "secrets", "claude-oauth-token"), "utf8").trim();
+  } catch {
+    return "";
+  }
 }
-async function sysSetModel(chat_id, idx, messageId) {
-  const m = MODELS[Number(idx)];
-  if (!m)
-    return void sendReply({ chat_id, text: "\u041D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u0430\u044F \u043C\u043E\u0434\u0435\u043B\u044C." });
+async function fetchModels() {
+  if (modelsCache.length && Date.now() - modelsCacheAt < MODELS_TTL_MS)
+    return modelsCache;
+  const token = oauthToken();
+  if (!token) {
+    LOG("models: no OAuth token \u2014 using fallback list");
+    return modelsCache.length ? modelsCache : MODELS_FALLBACK;
+  }
+  try {
+    const r = await fetch(MODELS_URL, {
+      headers: { authorization: `Bearer ${token}`, "anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20" },
+      signal: AbortSignal.timeout(1e4)
+    });
+    if (!r.ok)
+      throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    const list = (Array.isArray(j?.data) ? j.data : []).filter((m) => typeof m?.id === "string").sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? ""))).slice(0, MODELS_MAX).map((m) => ({ label: String(m.display_name ?? m.id).replace(/^Claude\s+/i, ""), id: m.id, ctx1m: Number(m.max_input_tokens ?? 0) >= 1e6 }));
+    if (!list.length)
+      throw new Error("empty catalogue");
+    modelsCache = list;
+    modelsCacheAt = Date.now();
+    LOG(`models: catalogue refreshed (${list.length}): ${list.map((m) => m.id).join(", ")}`);
+    return modelsCache;
+  } catch (e) {
+    LOG(`models: catalogue fetch failed (${e?.message ?? e}) \u2014 using ${modelsCache.length ? "cached" : "fallback"} list`);
+    return modelsCache.length ? modelsCache : MODELS_FALLBACK;
+  }
+}
+async function sysModels(chat_id) {
+  const models = await fetchModels();
+  const live = modelsCacheAt > 0;
+  const buttons = models.map((m) => {
+    const row = [{ text: m.label, data: `sys:model:${m.id}` }];
+    if (MODELS_1M && m.ctx1m)
+      row.push({ text: `${m.label} \xB7 1M`, data: `sys:model:${m.id}[1m]` });
+    return row;
+  });
+  const note = live ? "" : `
+\u26A0\uFE0F \u043A\u0430\u0442\u0430\u043B\u043E\u0433 \u043C\u043E\u0434\u0435\u043B\u0435\u0439 \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D, \u0441\u043F\u0438\u0441\u043E\u043A \u0440\u0435\u0437\u0435\u0440\u0432\u043D\u044B\u0439`;
+  return sendReply({ chat_id, text: `\uD83E\uDDE0 \u0412\u044B\u0431\u0435\u0440\u0438 \u043C\u043E\u0434\u0435\u043B\u044C (\u043F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0435\u043D\u0438\u0435 \u043D\u0430 \u043B\u0435\u0442\u0443, \u0431\u0435\u0437 \u0440\u0435\u0441\u0442\u0430\u0440\u0442\u0430)${note}:`, buttons });
+}
+async function sysSetModel(chat_id, key, messageId) {
+  const models = await fetchModels();
+  const base1m = key.endsWith("[1m]") ? key.slice(0, -4) : "";
+  const b = base1m ? models.find((x) => x.id === base1m) ?? MODELS_FALLBACK.find((x) => x.id === base1m) : undefined;
+  const m = models.find((x) => x.id === key) ?? MODELS_FALLBACK.find((x) => x.id === key) ?? (b ? { label: `${b.label} \xB7 1M`, id: key } : undefined) ?? (/^claude-[a-z0-9.[\]-]+$/i.test(key) ? { label: key, id: key } : undefined);
+  if (!m) {
+    const stale = /^\d+$/.test(key);
+    return void sendReply({ chat_id, text: stale ? "\u26A0\uFE0F \u041A\u043D\u043E\u043F\u043A\u0430 \u0438\u0437 \u0443\u0441\u0442\u0430\u0440\u0435\u0432\u0448\u0435\u0433\u043E \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u044F \u2014 \u0441\u043F\u0438\u0441\u043E\u043A \u043C\u043E\u0434\u0435\u043B\u0435\u0439 \u0441 \u0442\u0435\u0445 \u043F\u043E\u0440 \u043C\u0435\u043D\u044F\u043B\u0441\u044F. \u041E\u0442\u043F\u0440\u0430\u0432\u044C /model \u0437\u0430\u043D\u043E\u0432\u043E." : "\u041D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u0430\u044F \u043C\u043E\u0434\u0435\u043B\u044C." });
+  }
   if (!sh(["tmux", "has-session", "-t", TMUX_SESSION]).ok)
-    return void sendReply({ chat_id, text: `\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F ${TMUX_SESSION} \u043D\u0435 \u0437\u0430\u043F\u0443\u0449\u0435\u043D\u0430 \u2014 \u043F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0430\u0442\u044C \u043D\u0435\u043A\u043E\u0433\u043E.` });
+    return void sendReply({ chat_id, text: `\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F ${SESSION_LABEL} \u043D\u0435 \u0437\u0430\u043F\u0443\u0449\u0435\u043D\u0430 \u2014 \u043F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0430\u0442\u044C \u043D\u0435\u043A\u043E\u0433\u043E.` });
   sh(["tmux", "send-keys", "-t", TMUX_SESSION, "-l", `/model ${m.id}`]);
   sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"]);
   await sleep(2500);
@@ -699,6 +938,19 @@ async function sysSetModel(chat_id, idx, messageId) {
     confirmed = true;
     await sleep(1200);
   }
+  await sleep(800);
+  const tail = paneTail();
+  const err = /does not support this model[^\n]*/i.exec(tail) ?? /claude_code_version_too_old/i.exec(tail) ?? /API error: \d+[^\n]*/i.exec(tail) ?? /invalid_request_error[^\n]*/i.exec(tail);
+  if (err) {
+    const old = /version (\d+\.\d+\.\d+) or newer is required/i.exec(tail);
+    const hint = old ? `
+\u041D\u0443\u0436\u0435\u043D Claude Code ${old[1]}+ (\u0441\u0435\u0439\u0447\u0430\u0441 \u0434\u0440\u0443\u0433\u043E\u0439). \u041E\u0431\u043D\u043E\u0432\u0438 \u0438 \u043F\u043E\u0432\u0442\u043E\u0440\u0438.` : "";
+    const bad = `\u26A0\uFE0F \u041D\u0435 \u043F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0438\u043B \u043D\u0430 ${m.label} (${m.id})
+${err[0].slice(0, 300)}${hint}`;
+    if (messageId)
+      return void call("editMessageText", { chat_id, message_id: messageId, text: bad }).catch(() => sendReply({ chat_id, text: bad }));
+    return void sendReply({ chat_id, text: bad });
+  }
   const txt = `\uD83E\uDDE0 \u041F\u0435\u0440\u0435\u043A\u043B\u044E\u0447\u0438\u043B \u043D\u0430 ${m.label}
 (${m.id})${confirmed ? `
 \u2705 \u0434\u0438\u0430\u043B\u043E\u0433 \u043F\u043E\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043D\u0438\u044F \u043D\u0430\u0436\u0430\u043B \u0437\u0430 \u0442\u0435\u0431\u044F` : ""}`;
@@ -706,6 +958,45 @@ async function sysSetModel(chat_id, idx, messageId) {
     call("editMessageText", { chat_id, message_id: messageId, text: txt }).catch(() => sendReply({ chat_id, text: txt }));
   else
     sendReply({ chat_id, text: txt });
+}
+var EFFORTS = [
+  { id: "low", label: "low \xB7 \u0431\u044B\u0441\u0442\u0440\u043E" },
+  { id: "medium", label: "medium" },
+  { id: "high", label: "high" },
+  { id: "xhigh", label: "xhigh \xB7 \u0433\u043B\u0443\u0431\u043E\u043A\u043E" },
+  { id: "max", label: "max \xB7 \u043C\u0430\u043A\u0441\u0438\u043C\u0443\u043C" },
+  { id: "auto", label: "auto \xB7 \u043F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E \u043C\u043E\u0434\u0435\u043B\u0438" }
+];
+function sysEfforts(chat_id) {
+  const buttons = [
+    EFFORTS.slice(0, 3).map((e) => ({ text: e.label, data: `sys:effort:${e.id}` })),
+    EFFORTS.slice(3, 5).map((e) => ({ text: e.label, data: `sys:effort:${e.id}` })),
+    [{ text: EFFORTS[5].label, data: `sys:effort:${EFFORTS[5].id}` }]
+  ];
+  return sendReply({ chat_id, text: "\u26A1 \u0412\u044B\u0431\u0435\u0440\u0438 effort: \u043D\u0430\u0441\u043A\u043E\u043B\u044C\u043A\u043E \u0434\u043E\u043B\u0433\u043E \u043C\u043E\u0434\u0435\u043B\u044C \u0434\u0443\u043C\u0430\u0435\u0442 \u043F\u0435\u0440\u0435\u0434 \u043E\u0442\u0432\u0435\u0442\u043E\u043C (\u043D\u0430 \u043B\u0435\u0442\u0443, \u0431\u0435\u0437 \u0440\u0435\u0441\u0442\u0430\u0440\u0442\u0430):", buttons });
+}
+async function sysSetEffort(chat_id, level, messageId) {
+  const out = (t) => messageId ? void call("editMessageText", { chat_id, message_id: messageId, text: t }).catch(() => sendReply({ chat_id, text: t })) : void sendReply({ chat_id, text: t });
+  if (!EFFORTS.some((e) => e.id === level))
+    return out(`\u041D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u044B\u0439 \u0443\u0440\u043E\u0432\u0435\u043D\u044C \xAB${level}\xBB. \u0412\u0430\u0440\u0438\u0430\u043D\u0442\u044B: ${EFFORTS.map((e) => e.id).join(", ")}`);
+  if (!sh(["tmux", "has-session", "-t", TMUX_SESSION]).ok)
+    return out(`\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F ${SESSION_LABEL} \u043D\u0435 \u0437\u0430\u043F\u0443\u0449\u0435\u043D\u0430 \u2014 \u043C\u0435\u043D\u044F\u0442\u044C effort \u043D\u0435\u043A\u043E\u043C\u0443.`);
+  sh(["tmux", "send-keys", "-t", TMUX_SESSION, "-l", `/effort ${level}`]);
+  sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"]);
+  await sleep(2500);
+  const re = /(?:Set effort level to|Effort level set to|Effort set to|Invalid argument|exceeds the cap|not supported|does not support)[^\n]*/gi;
+  const last = [...paneTail(40).matchAll(re)].pop()?.[0]?.trim() ?? "";
+  if (/^(?:Set effort level to|Effort level set to|Effort set to)/i.test(last) && last.toLowerCase().includes(level)) {
+    const scope = /this session only/i.test(last) ? `
+\u0414\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 \u0434\u043E \u0440\u0435\u0441\u0442\u0430\u0440\u0442\u0430 \u0441\u0435\u0441\u0441\u0438\u0438.` : /saved as your default/i.test(last) ? `
+\u0421\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u043E \u043F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E, \u043F\u0435\u0440\u0435\u0436\u0438\u0432\u0451\u0442 \u0440\u0435\u0441\u0442\u0430\u0440\u0442.` : "";
+    return out(`\u26A1 Effort: ${level}${scope}
+
+${last.slice(0, 300)}`);
+  }
+  if (last && !/^(?:Set effort level to|Effort level set to|Effort set to)/i.test(last))
+    return out(`\u26A0\uFE0F Effort \u043D\u0435 \u043F\u043E\u043C\u0435\u043D\u044F\u043B\u0441\u044F: ${last.slice(0, 300)}`);
+  return out(`\u26A1 \u041E\u0442\u043F\u0440\u0430\u0432\u0438\u043B /effort ${level}, \u043D\u043E \u043F\u043E\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043D\u0438\u044F \u043D\u0430 \u044D\u043A\u0440\u0430\u043D\u0435 \u043D\u0435 \u0432\u0438\u0436\u0443. \u041F\u0440\u043E\u0432\u0435\u0440\u044C: /screen`);
 }
 var PROMPT_POLL_MS = 5000;
 var promptFp = "";
@@ -755,7 +1046,7 @@ ${p.block}`, buttons: [digits, ctl] }).catch((e) => LOG(`relayPrompt: ${e.messag
 }
 async function sysTuiKey(chat_id, key, messageId) {
   if (!sh(["tmux", "has-session", "-t", TMUX_SESSION]).ok)
-    return void sendReply({ chat_id, text: `\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F ${TMUX_SESSION} \u043D\u0435 \u0437\u0430\u043F\u0443\u0449\u0435\u043D\u0430.` });
+    return void sendReply({ chat_id, text: `\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F ${SESSION_LABEL} \u043D\u0435 \u0437\u0430\u043F\u0443\u0449\u0435\u043D\u0430.` });
   if (key === "enter")
     sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"]);
   else if (key === "esc")
@@ -777,7 +1068,7 @@ ${out || "(\u043F\u0443\u0441\u0442\u043E)"}`;
     sendReply({ chat_id, text: txt });
 }
 function sysRestartPrompt(chat_id) {
-  return sendReply({ chat_id, text: "\uD83D\uDD04 \u041F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u0442\u0438\u0442\u044C \u0441\u0435\u0441\u0441\u0438\u044E Claude? \u0414\u0435\u043C\u043E\u043D \u0443\u0431\u044C\u0451\u0442 \u0438 \u043F\u043E\u0434\u043D\u0438\u043C\u0435\u0442 \u0435\u0451 \u0437\u0430\u043D\u043E\u0432\u043E; \u0432\u0445\u043E\u0434\u044F\u0449\u0438\u0435 \u0432 \u044D\u0442\u043E \u0432\u0440\u0435\u043C\u044F \u0431\u0443\u0444\u0435\u0440\u0438\u0437\u0443\u044E\u0442\u0441\u044F \u0438 \u0434\u043E\u0433\u0440\u0443\u0437\u044F\u0442\u0441\u044F.", buttons: [
+  return sendReply({ chat_id, text: `\uD83D\uDD04 \u041F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u0442\u0438\u0442\u044C \u0441\u0435\u0441\u0441\u0438\u044E ${SESSION_LABEL}? \u0414\u0435\u043C\u043E\u043D \u0443\u0431\u044C\u0451\u0442 \u0438 \u043F\u043E\u0434\u043D\u0438\u043C\u0435\u0442 \u0435\u0451 \u0437\u0430\u043D\u043E\u0432\u043E; \u0432\u0445\u043E\u0434\u044F\u0449\u0438\u0435 \u0432 \u044D\u0442\u043E \u0432\u0440\u0435\u043C\u044F \u0431\u0443\u0444\u0435\u0440\u0438\u0437\u0443\u044E\u0442\u0441\u044F \u0438 \u0434\u043E\u0433\u0440\u0443\u0437\u044F\u0442\u0441\u044F.`, buttons: [
     [{ text: "\u2705 \u041F\u043E\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u044C", data: "sys:restart:yes" }, { text: "\u274C \u041E\u0442\u043C\u0435\u043D\u0430", data: "sys:restart:no" }]
   ] });
 }
@@ -789,7 +1080,7 @@ async function doRestart(chat_id, messageId) {
   if (Date.now() - lastRestartAt < 60000)
     return void editOrSend("\u23F3 \u0420\u0435\u0441\u0442\u0430\u0440\u0442 \u0443\u0436\u0435 \u0437\u0430\u043F\u0443\u0441\u043A\u0430\u043B\u0441\u044F <1 \u043C\u0438\u043D \u043D\u0430\u0437\u0430\u0434. \u041F\u043E\u0434\u043E\u0436\u0434\u0438.");
   lastRestartAt = Date.now();
-  await editOrSend("\uD83D\uDD04 \u041F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u0430\u044E \u0441\u0435\u0441\u0441\u0438\u044E Claude...");
+  await editOrSend(`\uD83D\uDD04 \u041F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A\u0430\u044E \u0441\u0435\u0441\u0441\u0438\u044E ${SESSION_LABEL}...`);
   const r = sh(["bash", SYS_RESTART_CMD], 20000);
   await sendReply({ chat_id, text: r.ok ? "\u2705 \u0420\u0435\u0441\u0442\u0430\u0440\u0442 \u0437\u0430\u043F\u0443\u0449\u0435\u043D. \u0421\u0435\u0441\u0441\u0438\u044F \u043F\u043E\u0434\u043D\u0438\u043C\u0435\u0442\u0441\u044F \u0437\u0430 ~15\u0441, \u043D\u043E\u0432\u044B\u0439 \u0438\u043D\u0441\u0442\u0430\u043D\u0441 \u043E\u0442\u0432\u0435\u0442\u0438\u0442 \u043A\u0430\u043A \u0431\u0443\u0434\u0435\u0442 \u0433\u043E\u0442\u043E\u0432." : `\u274C \u0420\u0435\u0441\u0442\u0430\u0440\u0442 \u043D\u0435 \u0443\u0434\u0430\u043B\u0441\u044F: ${r.out}` });
 }
@@ -800,6 +1091,7 @@ var BOT_COMMANDS = [
   { command: "screen", description: "\u041F\u043E\u043A\u0430\u0437\u0430\u0442\u044C \u044D\u043A\u0440\u0430\u043D \u0441\u0435\u0441\u0441\u0438\u0438" },
   { command: "restart", description: "\u041F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u0442\u0438\u0442\u044C \u0441\u0435\u0441\u0441\u0438\u044E" },
   { command: "model", description: "\uD83E\uDDE0 \u0412\u044B\u0431\u0440\u0430\u0442\u044C \u043C\u043E\u0434\u0435\u043B\u044C" },
+  { command: "effort", description: "\u26A1 \u0423\u0440\u043E\u0432\u0435\u043D\u044C effort" },
   { command: "mcp", description: "\uD83D\uDD0C \u0421\u0442\u0430\u0442\u0443\u0441 MCP-\u0441\u0435\u0440\u0432\u0435\u0440\u043E\u0432" },
   { command: "logs", description: "\u041B\u043E\u0433 gateway" }
 ];
@@ -841,12 +1133,16 @@ async function handleSysCommand(chat_id, text) {
     case "model":
     case "models":
       return sysModels(chat_id);
+    case "effort": {
+      const lvl = (/^\/sys\b/i.test(text) ? text.split(/\s+/)[2] : text.split(/\s+/)[1])?.toLowerCase();
+      return lvl ? sysSetEffort(chat_id, lvl) : sysEfforts(chat_id);
+    }
     case "mcp":
       return sysMcp(chat_id);
     case "cc":
       return sysSendKeys(chat_id, text.replace(/^\/sys\s+cc\s*/i, ""));
     default:
-      return sendReply({ chat_id, text: "\u041A\u043E\u043C\u0430\u043D\u0434\u044B: /menu \xB7 /sys ping \xB7 /sys status \xB7 /sys logs \xB7 /sys screen \xB7 /sys restart \xB7 /sys mcp \xB7 /sys cc <\u043A\u043E\u043C\u0430\u043D\u0434\u0430> (\u043D\u0430\u043F\u0440. /sys cc /compact)" });
+      return sendReply({ chat_id, text: "\u041A\u043E\u043C\u0430\u043D\u0434\u044B: /menu \xB7 /sys ping \xB7 /sys status \xB7 /sys logs \xB7 /sys screen \xB7 /sys restart \xB7 /sys mcp \xB7 /model \xB7 /effort [low|medium|high|xhigh|max|auto] \xB7 /sys cc <\u043A\u043E\u043C\u0430\u043D\u0434\u0430> (\u043D\u0430\u043F\u0440. /sys cc /compact)" });
   }
 }
 async function pumpOutbox() {
@@ -900,13 +1196,13 @@ function checkBrain() {
   if (brainWasAlive === null) {
     brainWasAlive = alive;
     if (!alive)
-      tell(`\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F Claude \u043D\u0435 \u043D\u0430 \u0441\u0432\u044F\u0437\u0438 (heartbeat \u043C\u043E\u0441\u0442\u0430 ${age === Infinity ? "\u043E\u0442\u0441\u0443\u0442\u0441\u0442\u0432\u0443\u0435\u0442" : "\u0443\u0441\u0442\u0430\u0440\u0435\u043B"}). \u0412\u0445\u043E\u0434\u044F\u0449\u0438\u0435 \u0431\u0443\u0444\u0435\u0440\u0438\u0437\u0443\u044E\u0442\u0441\u044F. \u041F\u043E\u0434\u043D\u0438\u043C\u0438 \u0435\u0451: /restart`);
+      tell(`\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F ${SESSION_LABEL} \u043D\u0435 \u043D\u0430 \u0441\u0432\u044F\u0437\u0438 (heartbeat \u043C\u043E\u0441\u0442\u0430 ${age === Infinity ? "\u043E\u0442\u0441\u0443\u0442\u0441\u0442\u0432\u0443\u0435\u0442" : "\u0443\u0441\u0442\u0430\u0440\u0435\u043B"}). \u0412\u0445\u043E\u0434\u044F\u0449\u0438\u0435 \u0431\u0443\u0444\u0435\u0440\u0438\u0437\u0443\u044E\u0442\u0441\u044F. \u041F\u043E\u0434\u043D\u0438\u043C\u0438 \u0435\u0451: /restart`);
   } else if (brainWasAlive && !alive) {
     brainWasAlive = false;
-    tell(`\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F Claude \u043C\u043E\u043B\u0447\u0438\u0442 ~${Math.round(age / 60000)} \u043C\u0438\u043D \u2014 \u043C\u043E\u0441\u0442 \u043F\u0435\u0440\u0435\u0441\u0442\u0430\u043B \u0441\u043B\u0430\u0442\u044C heartbeat. \u0412\u0445\u043E\u0434\u044F\u0449\u0438\u0435 \u0431\u0443\u0444\u0435\u0440\u0438\u0437\u0443\u044E\u0442\u0441\u044F \u0438 \u0434\u043E\u0435\u0434\u0443\u0442. \u0416\u043C\u0438 /restart, \u0434\u0435\u0442\u0430\u043B\u0438: /status`);
+    tell(`\uD83D\uDD34 \u0421\u0435\u0441\u0441\u0438\u044F ${SESSION_LABEL} \u043C\u043E\u043B\u0447\u0438\u0442 ~${Math.round(age / 60000)} \u043C\u0438\u043D \u2014 \u043C\u043E\u0441\u0442 \u043F\u0435\u0440\u0435\u0441\u0442\u0430\u043B \u0441\u043B\u0430\u0442\u044C heartbeat. \u0412\u0445\u043E\u0434\u044F\u0449\u0438\u0435 \u0431\u0443\u0444\u0435\u0440\u0438\u0437\u0443\u044E\u0442\u0441\u044F \u0438 \u0434\u043E\u0435\u0434\u0443\u0442. \u0416\u043C\u0438 /restart, \u0434\u0435\u0442\u0430\u043B\u0438: /status`);
   } else if (!brainWasAlive && alive) {
     brainWasAlive = true;
-    tell("\uD83D\uDFE2 \u0421\u0435\u0441\u0441\u0438\u044F Claude \u0441\u043D\u043E\u0432\u0430 \u043D\u0430 \u0441\u0432\u044F\u0437\u0438 \u2014 heartbeat \u043F\u043E\u0448\u0451\u043B, \u0431\u044D\u043A\u043B\u043E\u0433 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0439 \u0434\u043E\u0435\u0437\u0436\u0430\u0435\u0442.");
+    tell(`\uD83D\uDFE2 \u0421\u0435\u0441\u0441\u0438\u044F ${SESSION_LABEL} \u0441\u043D\u043E\u0432\u0430 \u043D\u0430 \u0441\u0432\u044F\u0437\u0438 \u2014 heartbeat \u043F\u043E\u0448\u0451\u043B, \u0431\u044D\u043A\u043B\u043E\u0433 \u0441\u043E\u043E\u0431\u0449\u0435\u043D\u0438\u0439 \u0434\u043E\u0435\u0437\u0436\u0430\u0435\u0442.`);
   }
 }
 var AUTH_DOWN_RE = /Please run \/login|Invalid authentication credentials|API Error:\s*401|Credit balance is too low|OAuth token has expired/i;
@@ -1006,6 +1302,7 @@ async function main() {
       if (!p) {
         promptFp = "";
         promptSeen = 0;
+        alertedFp = "";
         return;
       }
       if (p.fp === promptFp)
@@ -1024,12 +1321,13 @@ async function main() {
   }, PROMPT_POLL_MS);
   setInterval(() => {
     const now = Date.now();
-    for (const [chat, started] of typingChats) {
+    for (const [key, started] of typingChats) {
       if (now - started > TYPING_MAX_MS) {
-        typingChats.delete(chat);
+        typingChats.delete(key);
         continue;
       }
-      call("sendChatAction", { chat_id: chat, action: "typing" }).catch(() => {});
+      const [chat, thread] = key.split(":");
+      call("sendChatAction", { chat_id: chat, ...thread ? { message_thread_id: Number(thread) } : {}, action: "typing" }).catch(() => {});
     }
   }, 4500);
   setInterval(() => {

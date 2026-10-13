@@ -14,6 +14,14 @@ param(
 $ErrorActionPreference = "Stop"
 function Say($m){ Write-Host "> $m" -ForegroundColor Cyan }
 function Die($m){ Write-Host "x $m" -ForegroundColor Red; exit 1 }
+# Native commands (node, claude) write progress to stderr. Under Windows PowerShell 5.1
+# with ErrorActionPreference=Stop, stderr from a native command becomes a terminating
+# NativeCommandError once streams are redirected (e.g. when an AI assistant runs this
+# script). Run them with Continue and print their output as plain text.
+function Native([scriptblock]$Block) {
+  $old = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+  try { & $Block 2>&1 | ForEach-Object { Write-Host "$_" } } finally { $ErrorActionPreference = $old }
+}
 
 $Repo  = $PSScriptRoot
 $State = if ($StateDir) { $StateDir } elseif ($env:TELEGRAM_STATE_DIR) { $env:TELEGRAM_STATE_DIR } else { "$env:USERPROFILE\.claude\channels\tg-gateway" }
@@ -23,7 +31,7 @@ $Launcher = Join-Path $BinDir $LauncherName
 $Wrapper  = Join-Path $State "run-gateway.cmd"
 $Managed  = "C:\ProgramData\ClaudeCode\managed-settings.json"   # [VERIFY-PILOT]
 
-if (-not (Get-Command node   -EA SilentlyContinue)) { Die "node not found - Claude Code needs it; install Node 18+ first." }
+if (-not (Get-Command node   -EA SilentlyContinue)) { Die "node not found - install Node.js LTS first: winget install --id OpenJS.NodeJS.LTS -e" }
 if (-not (Get-Command claude -EA SilentlyContinue)) { Die "claude (Claude Code) not found - set it up first." }
 if (-not (Test-Path $Gw)) { Die "missing $Gw - run this from the repo clone." }
 $Node = (Get-Command node).Source
@@ -39,7 +47,8 @@ if ((Test-Path $envFile) -and (Select-String -Path $envFile -Pattern '^TELEGRAM_
   Say "pairing - open Telegram, message your bot /start"
   $env:TELEGRAM_BOT_TOKEN = $Token
   $env:TELEGRAM_STATE_DIR = $State
-  & $Node $Gw pair
+  Native { & $Node $Gw pair }
+  if (-not ((Test-Path $envFile) -and (Select-String -Path $envFile -Pattern '^TELEGRAM_SYS_ADMINS' -Quiet))) { Die "pairing did not finish (no message to the bot within 5 min?) - run the script again" }
 }
 
 # 2. Scheduled Task supervisor (at logon, restart on failure). Use a .cmd wrapper
@@ -60,10 +69,12 @@ Say "task registered and started"
 
 # 3. Register the bridge plugin.
 Say "registering bridge plugin (telegram@telegram-local)"
-& claude plugin marketplace add "$Repo\bridge"          2>$null
-& claude plugin install telegram@telegram-local          2>$null
-& claude plugin enable  telegram@telegram-local          2>$null
-& claude plugin disable telegram@claude-plugins-official 2>$null
+Native { & claude plugin marketplace add "$Repo\bridge" }
+Native { & claude plugin install telegram@telegram-local }
+Native { & claude plugin enable  telegram@telegram-local }
+Native { & claude plugin disable telegram@claude-plugins-official }
+$plugins = (& { $ErrorActionPreference = "Continue"; & claude plugin list 2>&1 }) | Out-String
+if ($plugins -notmatch 'telegram@telegram-local') { Say "WARN: telegram@telegram-local not in 'claude plugin list' - check it manually" }
 
 # 4. Channel allowlist via managed-settings (admin). Fall back to dev-flag launcher.
 $devflag = $false

@@ -24,7 +24,7 @@ script step misbehaves.
 ## 0. Prerequisites (all OS)
 
 1. **Claude Code is installed and working** (`claude --version`). If not, set that up first — that's the normal onboarding.
-2. **Node.js present** (`node --version`, v18+). Claude Code needs it, so it's almost always there. The gateway and bridge run on node — no bun, no npm install required.
+2. **Node.js present** (`node --version`, v18+). The gateway and bridge run on node — no bun, no npm install required. The native Claude Code installer does NOT bring node: install it first (Windows `winget install --id OpenJS.NodeJS.LTS -e`; macOS the nodejs.org pkg, or unpack the official tarball into `~/.local/node` and put its `bin` on PATH when there is no admin password).
 3. **A Telegram bot token**: the user creates a bot via [@BotFather](https://t.me/BotFather) (`/newbot`) and gives you the token (looks like `123456789:AAE...`). Recommend they also set BotFather → Bot Settings → **Allow Groups? Off** and, if available, **Restrict bot usage** (Access) to themselves.
 4. Pick install paths (defaults; override only if needed):
    - Repo/install dir: `REPO` = where this repo is cloned (keep it; the daemon runs from here).

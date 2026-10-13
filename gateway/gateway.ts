@@ -6,7 +6,7 @@
  */
 import { homedir } from "os";
 import { join } from "path";
-import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, unlinkSync, renameSync, statSync } from "fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, unlinkSync, renameSync, statSync, copyFileSync } from "fs";
 import { spawnSync } from "child_process"; // node builtin — works on both bun and node runtimes
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), ".claude", "channels", "tg-gateway");
@@ -34,7 +34,7 @@ const CONFIG_ENV_FILE = process.env.TG_GATEWAY_ENV ?? join(STATE_DIR, "gateway.e
     }
   } catch {}
 })();
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const STALE_MS = 180_000; // no successful poll in 3 min => wedged; exit so the supervisor restarts fresh
 // /sys + /menu control commands: who may run them, where the session lives, how to restart it.
 const SYS_ADMINS = new Set((process.env.TELEGRAM_SYS_ADMINS ?? "").split(",").map(s => s.trim()).filter(Boolean));
@@ -45,10 +45,27 @@ const ALLOWED_CHATS = new Set([
   ...(process.env.TELEGRAM_ALLOWED_CHATS ?? "").split(",").map(s => s.trim()).filter(Boolean),
   ...SYS_ADMINS,
 ]);
-function isAllowedChat(chatId: string, userId: string): boolean {
-  return ALLOWED_CHATS.has("*") || ALLOWED_CHATS.has(chatId) || SYS_ADMINS.has(userId);
+// A group is ONE chat_id for everyone in it, so a chat-level allow would hand the
+// session to whoever gets invited later. Groups therefore need the sender to be known
+// too: TELEGRAM_ALLOWED_GROUP_USERS="id1,id2" (admins are always in).
+const ALLOWED_GROUP_USERS = new Set([
+  ...(process.env.TELEGRAM_ALLOWED_GROUP_USERS ?? "").split(",").map(s => s.trim()).filter(Boolean),
+  ...SYS_ADMINS,
+]);
+function isAllowedChat(chatId: string, userId: string, isGroup = false): boolean {
+  if (ALLOWED_CHATS.has("*")) return true;
+  if (isGroup) return ALLOWED_CHATS.has(chatId) && ALLOWED_GROUP_USERS.has(userId);
+  return ALLOWED_CHATS.has(chatId) || SYS_ADMINS.has(userId);
 }
+// Forum topics: name cache (Telegram sends the title only in the forum_topic_created
+// service message, never with ordinary messages) and the control-plane's current
+// topic, so /sys answers land in the topic the command came from rather than General.
+const topicNames = new Map<string, string>();  // "chat:thread" -> title
+const sysThread = new Map<string, string>();   // chat_id -> thread awaiting a control-plane answer
 const TMUX_SESSION = process.env.CLAUDE_TMUX ?? "claude";
+// User-facing label for the session in control-panel text. Set TG_SESSION_LABEL
+// (e.g. "ассистента") to rename it per bot.
+const SESSION_LABEL = process.env.TG_SESSION_LABEL ?? "Claude";
 const SYS_RESTART_CMD = process.env.SYS_RESTART_CMD ?? ""; // path to restart script; empty = restart disabled (safe default)
 const BRIDGE_HEARTBEAT = join(STATE_DIR, "bridge.heartbeat");
 // Instant transport-level acknowledgement: react to an inbound message so the user
@@ -56,7 +73,10 @@ const BRIDGE_HEARTBEAT = join(STATE_DIR, "bridge.heartbeat");
 // work is underway (mirrors the old official-plugin behavior).
 const ACK_EMOJI = process.env.TELEGRAM_ACK_EMOJI ?? "👀";
 const TYPING_MAX_MS = 8 * 60_000; // refresh "typing…" at most 8 min per chat, then give up
-const typingChats = new Map<string, number>(); // chat_id -> ms work started; drives the typing indicator
+const typingChats = new Map<string, number>(); // "chat" or "chat:thread" -> ms work started; drives the typing indicator
+// One key per conversation: in a forum every topic gets its own indicator, otherwise
+// a reply in one topic would clear "typing…" in all of them.
+const typingKey = (chatId: string, threadId?: string) => (threadId ? `${chatId}:${threadId}` : String(chatId));
 // Content-aware reaction palette (our own variant — richer than a fixed 👀).
 // First rule whose pattern matches the inbound text wins; otherwise ACK_EMOJI.
 // Every emoji here is in Telegram's standard reaction whitelist (no variation selectors).
@@ -118,8 +138,11 @@ function loadToken(): string {
   LOG("FATAL: no TELEGRAM_BOT_TOKEN and no secrets/telegram-bot-token"); process.exit(1);
 }
 const TOKEN = loadToken();
-const API = `https://api.telegram.org/bot${TOKEN}`;
-const FILE_API = `https://api.telegram.org/file/bot${TOKEN}`;
+// TELEGRAM_API_ROOT lets a box point at a self-hosted local Bot API server
+// (http://127.0.0.1:8081) for large-file support; defaults to Telegram cloud.
+const API_ROOT = (process.env.TELEGRAM_API_ROOT || "https://api.telegram.org").replace(/\/+$/, "");
+const API = `${API_ROOT}/bot${TOKEN}`;
+const FILE_API = `${API_ROOT}/file/bot${TOKEN}`;
 
 class TgError extends Error { constructor(public status: number, msg: string) { super(msg); } }
 
@@ -138,19 +161,38 @@ async function call(method: string, body?: any, timeoutMs = 65000): Promise<any>
 }
 
 // ---------- inbox (drop-in format) ----------
-function writeInbox(name: string, obj: any) {
-  const tmp = join(INBOX, `.${name}.tmp`);
+function writeInbox(name: string, obj: any, dir: string = INBOX) {
+  const tmp = join(dir, `.${name}.tmp`);
   writeFileSync(tmp, JSON.stringify(obj, null, 2));
-  renameSync(tmp, join(INBOX, name));
+  renameSync(tmp, join(dir, name));
+}
+// Чаты, где темы обслуживает отдельный рантайм, а не общая сессия. Их сообщения
+// уходят в свой инбокс: иначе их подхватит мост и вольёт в общую сессию, ради
+// разделения которой всё и затевалось. Личка и General этих чатов идут как раньше.
+const TOPIC_RUNTIME_CHATS = new Set(
+  (process.env.TELEGRAM_TOPIC_RUNTIME_CHATS ?? "").split(",").map(s => s.trim()).filter(Boolean),
+);
+const TOPICS_INBOX = join(STATE_DIR, "topics", "inbox");
+function inboxDirFor(chatId: string, threadId: string): string {
+  if (threadId && TOPIC_RUNTIME_CHATS.has(chatId)) {
+    mkdirSync(TOPICS_INBOX, { recursive: true });
+    return TOPICS_INBOX;
+  }
+  return INBOX;
 }
 async function downloadFile(fileId: string, suggestExt?: string): Promise<string> {
   const f = await call("getFile", { file_id: fileId });
   const path = f.file_path as string;
   const ext = suggestExt ?? (path.includes(".") ? path.split(".").pop() : "bin");
   const dest = join(INBOX, `${Date.now()}-${fileId}.${ext}`);
-  const resp = await fetch(`${FILE_API}/${path}`);
-  const buf = Buffer.from(await resp.arrayBuffer());
-  writeFileSync(dest, buf);
+  if (path.startsWith("/")) {
+    // Local Bot API server (--local): getFile returns an absolute on-disk path
+    // instead of a relative one — copy it directly, no HTTP fetch, no size cap.
+    copyFileSync(path, dest);
+  } else {
+    const resp = await fetch(`${FILE_API}/${path}`);
+    writeFileSync(dest, Buffer.from(await resp.arrayBuffer()));
+  }
   return dest;
 }
 
@@ -218,12 +260,15 @@ async function handleCallback(cq: any) {
     if (rest === "models") return void sysModels(chat_id);
     if (rest === "mcp") return void sysMcp(chat_id);
     if (rest.startsWith("model:")) return void sysSetModel(chat_id, rest.slice(6), messageId);
+    if (rest === "efforts") return void sysEfforts(chat_id);
+    if (rest.startsWith("effort:")) return void sysSetEffort(chat_id, rest.slice(7), messageId);
     if (rest.startsWith("tui:")) return void sysTuiKey(chat_id, rest.slice(4), messageId);
     return;
   }
   const from = cq.from ?? {};
   const msg = cq.message ?? {};
-  if (!isAllowedChat(String(msg.chat?.id ?? from.id ?? ""), String(from.id ?? ""))) {
+  const cbIsGroup = msg.chat?.type === "group" || msg.chat?.type === "supergroup";
+  if (!isAllowedChat(String(msg.chat?.id ?? from.id ?? ""), String(from.id ?? ""), cbIsGroup)) {
     try { await call("answerCallbackQuery", { callback_query_id: cq.id }); } catch {}
     LOG(`DROP callback from non-allowed ${from.id}`); return;
   }
@@ -247,7 +292,16 @@ async function handleCallback(cq: any) {
     text: label,
     callback_data: data,
   };
-  writeInbox(`${Date.now()}-cbm-${cq.id}.json`, base);
+  // Keep the tap in its topic: the button message carries the thread it was posted in.
+  let cbThread = "";
+  if (msg.chat?.is_forum && msg.is_topic_message && msg.message_thread_id != null) {
+    cbThread = String(msg.message_thread_id);
+    base.message_thread_id = cbThread;
+    const title = topicNames.get(`${chatId}:${msg.message_thread_id}`);
+    if (title) base.topic = title;
+  }
+  // Нажатие в теме должно вернуться той же сессии, что задала вопрос, а не общей.
+  writeInbox(`${Date.now()}-cbm-${cq.id}.json`, base, inboxDirFor(chatId, cbThread));
   LOG(`inbox <- button-tap chat ${chatId} data="${data}" label="${label}"`);
 }
 
@@ -258,29 +312,53 @@ async function handleUpdate(u: any) {
   const from = msg.from ?? {};
   // Allowlist gate: unknown chats never reach the session (and never see the control
   // plane). SILENT drop — no reply at all, so probers can't even confirm the bot is
-  // alive (Andrey's call; Telegram has no server-side DM allowlist, BotFather can't do this).
+  // alive (owner's call; Telegram has no server-side DM allowlist, BotFather can't do this).
   const gateChat = String(msg.chat.id), gateUser = String(from.id ?? "");
-  if (!isAllowedChat(gateChat, gateUser)) {
+  const isGroup = msg.chat?.type === "group" || msg.chat?.type === "supergroup";
+  // A forum topic is message_thread_id. Guard on is_forum + is_topic_message: in an
+  // ordinary group message_thread_id also shows up on replies, and that is not a topic.
+  const isForum = msg.chat?.is_forum === true;
+  const threadId = isForum && msg.is_topic_message && msg.message_thread_id != null
+    ? String(msg.message_thread_id) : "";
+  const tKey = typingKey(gateChat, threadId);
+
+  // Topic titles arrive only in service messages, so remember them as they pass by.
+  if (msg.forum_topic_created?.name) topicNames.set(`${gateChat}:${msg.message_thread_id}`, msg.forum_topic_created.name);
+  if (msg.forum_topic_edited?.name) topicNames.set(`${gateChat}:${msg.message_thread_id}`, msg.forum_topic_edited.name);
+  // Service messages carry no user text — recording the title above is all we need.
+  if (msg.forum_topic_created || msg.forum_topic_edited || msg.forum_topic_closed
+      || msg.forum_topic_reopened || msg.new_chat_members || msg.left_chat_member) return;
+
+  if (!isAllowedChat(gateChat, gateUser, isGroup)) {
     LOG(`DROP non-allowed chat ${gateChat} user ${gateUser} (@${from.username ?? "?"}): ${(msg.text ?? "[media]").slice(0, 80)}`);
     return;
   }
   // Control commands are handled by the daemon directly (work even if the session is dead) and never forwarded.
-  const text0 = (msg.text ?? "").trim();
-  if (/^\/(sys|menu|ping|status|restart|screen|logs|model|models|mcp)\b/i.test(text0)) {
-    if (!SYS_ADMINS.has(String(from.id ?? ""))) { await call("sendMessage", { chat_id: String(msg.chat.id), text: "⛔ Команды управления доступны только владельцу." }).catch(() => {}); return; }
-    return void handleSysCommand(String(msg.chat.id), text0).catch((e: any) => LOG(`sys cmd error: ${e.message}`));
+  // In a group Telegram delivers them as "/status@botname" — strip the suffix or nothing matches.
+  const text0 = (msg.text ?? "").trim().replace(/^(\/[a-z_]+)@[A-Za-z0-9_]+/i, "$1");
+  if (/^\/(sys|menu|ping|status|restart|screen|logs|model|models|effort|mcp)\b/i.test(text0)) {
+    if (!SYS_ADMINS.has(String(from.id ?? ""))) { await call("sendMessage", { chat_id: gateChat, ...(threadId ? { message_thread_id: Number(threadId) } : {}), text: "⛔ Команды управления доступны только владельцу." }).catch(() => {}); return; }
+    if (threadId) sysThread.set(gateChat, threadId); else sysThread.delete(gateChat);
+    return void handleSysCommand(gateChat, text0)
+      .catch((e: any) => LOG(`sys cmd error: ${e.message}`))
+      .finally(() => sysThread.delete(gateChat));
   }
   // Instant ack BEFORE media download/STT: react (content-aware) + start "typing…".
-  call("setMessageReaction", { chat_id: String(msg.chat.id), message_id: Number(msg.message_id), reaction: [{ type: "emoji", emoji: pickReaction(msg.text ?? msg.caption ?? "") }] }).catch(() => {});
-  call("sendChatAction", { chat_id: String(msg.chat.id), action: "typing" }).catch(() => {});
-  typingChats.set(String(msg.chat.id), Date.now());
+  call("setMessageReaction", { chat_id: gateChat, message_id: Number(msg.message_id), reaction: [{ type: "emoji", emoji: pickReaction(msg.text ?? msg.caption ?? "") }] }).catch(() => {});
+  call("sendChatAction", { chat_id: gateChat, ...(threadId ? { message_thread_id: Number(threadId) } : {}), action: "typing" }).catch(() => {});
+  typingChats.set(tKey, Date.now());
   const base: any = {
-    chat_id: String(msg.chat.id),
+    chat_id: gateChat,
     message_id: String(msg.message_id),
     user: from.username ?? `${from.first_name ?? "user"}`,
     user_id: String(from.id ?? msg.chat.id),
     ts: new Date((msg.date ?? Date.now() / 1000) * 1000).toISOString(),
   };
+  if (threadId) {
+    base.message_thread_id = threadId;
+    const title = topicNames.get(`${gateChat}:${threadId}`);
+    if (title) base.topic = title;
+  }
   if (msg.reply_to_message) base.reply_to_message_id = String(msg.reply_to_message.message_id);
   try {
     if (msg.photo) {
@@ -294,23 +372,39 @@ async function handleUpdate(u: any) {
       if (stt) { base.text = `[голосовое, расшифровано в транспорте] ${stt}`; base.voice_transcribed = true; }
     } else if (msg.audio) {
       base.text = msg.caption ?? ""; base.attachment_file_id = msg.audio.file_id; base.attachment_kind = "audio";
+      base.attachment_mime = msg.audio.mime_type; base.attachment_size = msg.audio.file_size;
     } else if (msg.document) {
       base.text = msg.caption ?? ""; base.attachment_file_id = msg.document.file_id; base.attachment_kind = "document";
-      base.attachment_mime = msg.document.mime_type;
+      base.attachment_mime = msg.document.mime_type; base.attachment_size = msg.document.file_size;
     } else if (msg.video) {
       base.text = msg.caption ?? ""; base.attachment_file_id = msg.video.file_id; base.attachment_kind = "video";
+      base.attachment_mime = msg.video.mime_type; base.attachment_size = msg.video.file_size;
     } else if (msg.text) {
       base.text = msg.text;
     } else {
       base.text = msg.caption ?? "[unsupported message type]";
     }
   } catch (e: any) { LOG(`media handling error: ${e.message}`); base.text = base.text ?? "[media download failed]"; }
-  writeInbox(`${Date.now()}-${msg.message_id}.json`, base);
-  LOG(`inbox <- chat ${base.chat_id} msg ${base.message_id} ${base.image_path ? "[photo]" : base.attachment_kind ? `[${base.attachment_kind}]${base.voice_transcribed ? "+stt" : ""}` : ""}`);
+  // Telegram Bot API caps getFile downloads at 20 MB. Bigger audio/doc/video
+  // can't be fetched — tell the sender instead of leaving a silent reaction.
+  const TG_DL_LIMIT = Number(process.env.TELEGRAM_DL_LIMIT_MB || 20) * 1024 * 1024;
+  if (base.attachment_kind && !base.image_path && !base.voice_transcribed
+      && typeof base.attachment_size === "number" && base.attachment_size > TG_DL_LIMIT) {
+    const mb = Math.round(base.attachment_size / 1048576);
+    sendReply({ chat_id: base.chat_id, text: `⚠️ Файл слишком большой (${mb} МБ). Как бот я могу забирать из Telegram только файлы до 20 МБ. Пришли запись голосовым сообщением (оно сжато и обычно влезает), ссылкой на файл, или сожми/разрежь его, тогда обработаю.`, reply_to: base.message_id }).catch(() => {});
+    base.text = `${base.text ? base.text + " " : ""}[Вложение "${base.attachment_kind}" ${mb} МБ НЕ скачано: превышен лимит Telegram Bot API 20 МБ. Пользователю уже отправлено уведомление с просьбой прислать голосовым/ссылкой/сжать. Не пытайся скачивать это вложение.]`;
+    delete base.attachment_file_id;
+    LOG(`oversized ${base.attachment_kind} ${mb}MB from chat ${base.chat_id}: user notified`);
+  }
+  const dir = inboxDirFor(base.chat_id, threadId);
+  writeInbox(`${Date.now()}-${msg.message_id}.json`, base, dir);
+  LOG(`inbox${dir === INBOX ? "" : "(тема)"} <- chat ${base.chat_id}${threadId ? ` тема ${threadId}` : ""} msg ${base.message_id} ${base.image_path ? "[photo]" : base.attachment_kind ? `[${base.attachment_kind}]${base.voice_transcribed ? "+stt" : ""}` : ""}`);
   // If the brain can't answer right now the sender would otherwise get total
   // silence. Tell them immediately — the inbox entry above is still buffered and
   // gets answered once the session recovers.
-  const down = brainDownNow();
+  // Темы обслуживает свой рантайм, здоровье общей сессии их не касается —
+  // иначе человек в теме получит предупреждение о чужой поломке.
+  const down = dir === INBOX ? brainDownNow() : null;
   if (down) {
     const t = down === "auth"
       ? "⚠️ Получил, но Claude сейчас разлогинен (API 401) и не обрабатывает сообщения. Нужен /login в терминале или /restart. Отвечу, как починю."
@@ -359,11 +453,105 @@ function unescapeMd(s: string): string {
   return out.replace(/\\([_*\[\]()~`>#+\-=|{}.!])/g, "$1");
 }
 
+// ---------- Bot API 10.1 Rich Messages ----------
+// format:"rich" = the agent hands over plain GitHub-flavoured markdown (NO MarkdownV2
+// escaping) and Telegram renders tables, headings, lists, quotes and <details> natively
+// via sendRichMessage (cap 32 768 chars: one message instead of 4 096-char chunks).
+// Policy, same as Hermes: rich only where MarkdownV2 degrades (tables, structured
+// reports); ordinary replies stay MarkdownV2 so font/spacing don't jump between messages.
+// Any rejection falls back to a plain-text send so the message is never lost; a server
+// without the method (404) latches rich off until restart instead of failing every send.
+const RICH_MAX_CHARS = 32768;
+let richDisabled = false;
+// Telegram's rich renderer collapses a blank line between paragraphs into a plain
+// line break, so a prose reply arrives as one wall of text. A paragraph holding a
+// single U+2800 (braille blank) survives as an empty-looking line and restores the
+// air. Verified in the client 11.09.2026; headings, rules and quotes bring their own
+// spacing, so blocks that already breathe are left alone.
+const RICH_SPACER = "\u2800";
+const RICH_BREATHES = /^(?:#{1,6}\s|>|\||```|~~~|(?:-{3,}|\*{3,}|_{3,})\s*$)/;
+const RICH_LIST_ITEM = /^\s{0,3}(?:[-*+]\s|\d+[.)]\s)/;
+function richSpacing(md: string): string {
+  const lines = md.split("\n");
+  const out: string[] = [];
+  let fence: string | null = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const fenceMark = line.match(/^\s{0,3}(```+|~~~+)/);
+    if (fenceMark) fence = fence && line.trim().startsWith(fence) ? null : (fence ?? fenceMark[1]);
+    out.push(line);
+    if (fence || line.trim() !== "") continue;
+    // a blank line outside code: decide whether this gap needs a visible spacer
+    let j = i + 1;
+    while (j < lines.length && lines[j].trim() === "") j++;       // collapse runs of blanks
+    if (j >= lines.length) { for (let x = i + 1; x < j; x++) out.push(lines[x]); break; }  // trailing blanks: keep, nothing to space
+    const next = lines[j];
+    let k = out.length - 2;
+    while (k >= 0 && out[k].trim() === "") k--;
+    const prev = k >= 0 ? out[k] : "";
+    const bothList = RICH_LIST_ITEM.test(prev) && RICH_LIST_ITEM.test(next);
+    if (!bothList && !RICH_BREATHES.test(prev.trim()) && !RICH_BREATHES.test(next.trim())) {
+      out.push(RICH_SPACER, "");
+    }
+    for (let x = i + 1; x < j; x++) out.push(lines[x]);            // keep the original blanks
+    i = j - 1;
+  }
+  return out.join("\n");
+}
+function richPayload(text: string) { return { markdown: richSpacing(text) }; }
+function isRichCapabilityError(e: any): boolean {
+  return e?.status === 404 || /method not found|unknown method|not implemented/i.test(String(e?.message ?? ""));
+}
+// Last-resort plain rendering of GFM: strip heading/emphasis markers, flatten table rows.
+function richToPlain(md: string): string {
+  return md
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    .replace(/(\*\*|__)([^\n]*?)\1/g, "$2")
+    .replace(/^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$/gm, "")
+    .replace(/^\s*\|(.+)\|\s*$/gm, (_m, row: string) => row.split("|").map((c) => c.trim()).filter(Boolean).join(" · "))
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+async function trySendRich(args: any, reply_markup: any): Promise<{ message_ids: number[] } | null> {
+  const { chat_id, text, reply_to, disable_notification } = args;
+  if (richDisabled || !text || text.length > RICH_MAX_CHARS) return null;
+  const body: any = { chat_id, rich_message: richPayload(text) };
+  if (args.message_thread_id) body.message_thread_id = Number(args.message_thread_id);
+  if (disable_notification) body.disable_notification = true;
+  if (reply_markup) body.reply_markup = reply_markup;
+  if (reply_to) body.reply_parameters = { message_id: Number(reply_to) }; // reply_to_message_id is silently ignored by sendRichMessage
+  try {
+    const res = await call("sendRichMessage", body);
+    return { message_ids: [res.message_id] };
+  } catch (e: any) {
+    if (isRichCapabilityError(e)) { richDisabled = true; LOG(`rich: server has no sendRichMessage (${e.message}) — rich off until restart`); }
+    else LOG(`rich: sendRichMessage rejected (${e.message}) — plain fallback`);
+    return null;
+  }
+}
+
 async function sendReply(args: any): Promise<any> {
   const { chat_id, text, format, reply_to, files, disable_notification } = args;
-  typingChats.delete(String(chat_id)); // a reply is going out → stop the "typing…" loop for this chat
+  // Forum topic to answer into. The session passes it back from the inbound message;
+  // control-plane answers fall back to the topic the command was typed in, so /sys
+  // does not reply into General from a topic.
+  const thread = args.message_thread_id ?? sysThread.get(String(chat_id)) ?? "";
+  const threadArg = thread ? { message_thread_id: Number(thread) } : {};
+  typingChats.delete(typingKey(String(chat_id), thread ? String(thread) : undefined)); // reply going out → stop "typing…" for this topic
   const parse_mode = format === "markdownv2" ? "MarkdownV2" : undefined;
   const reply_markup = normalizeButtons(args.buttons);
+  if (format === "rich") {
+    // Captions can't be rich: attachments go first, bare, then the rich text as its own message.
+    const pre: number[] = [];
+    if (files && files.length) {
+      const f = await sendReply({ chat_id, files, text: "", disable_notification: true, message_thread_id: args.message_thread_id });
+      pre.push(...(f.message_ids ?? []));
+    }
+    const rich = await trySendRich({ ...args, files: undefined }, reply_markup);
+    if (rich) return { message_ids: [...pre, ...rich.message_ids] };
+    const plain = await sendReply({ ...args, files: undefined, format: "text", text: richToPlain(text ?? "") });
+    return { message_ids: [...pre, ...(plain.message_ids ?? [])] };
+  }
   const ids: number[] = [];
   if (files && files.length) {
     // Telegram caps captions at 1024 chars — overflow goes out as a follow-up
@@ -384,6 +572,7 @@ async function sendReply(args: any): Promise<any> {
       const attempt = async (method: string, field: string, cap: string, pm?: string) => {
         const fd = new FormData();
         fd.append("chat_id", String(chat_id));
+        if (thread) fd.append("message_thread_id", String(thread));
         fd.append("caption", cap);
         if (pm) fd.append("parse_mode", pm);
         if (disable_notification) fd.append("disable_notification", "true");
@@ -401,7 +590,7 @@ async function sendReply(args: any): Promise<any> {
       else LOG(`send file failed (${name}): ${j.description}`);
     }
     if (rest) {
-      const tail = await sendReply({ chat_id, text: rest, format, disable_notification, buttons: args.buttons });
+      const tail = await sendReply({ chat_id, text: rest, format, disable_notification, buttons: args.buttons, message_thread_id: thread || undefined });
       ids.push(...(tail.message_ids ?? []));
     }
     return { message_ids: ids };
@@ -412,7 +601,7 @@ async function sendReply(args: any): Promise<any> {
     // reply pings the user only once (or never, if disable_notification is set).
     const quiet = disable_notification || i < parts.length - 1;
     const last = i === parts.length - 1;
-    const body: any = { chat_id, text: parts[i] };
+    const body: any = { chat_id, text: parts[i], ...threadArg };
     if (parse_mode) body.parse_mode = parse_mode;
     if (quiet) body.disable_notification = true;
     if (reply_markup && last) body.reply_markup = reply_markup; // buttons go on the final chunk
@@ -421,7 +610,7 @@ async function sendReply(args: any): Promise<any> {
       const res = await call("sendMessage", body); ids.push(res.message_id);
     } catch (e: any) {
       if (parse_mode) { // fallback to plain text on parse error — strip the now-pointless md escapes
-        const res = await call("sendMessage", { chat_id, text: unescapeMd(parts[i]), ...(quiet ? { disable_notification: true } : {}), ...(reply_markup && last ? { reply_markup } : {}), ...(reply_to && i === 0 ? { reply_to_message_id: reply_to } : {}) });
+        const res = await call("sendMessage", { chat_id, text: unescapeMd(parts[i]), ...threadArg, ...(quiet ? { disable_notification: true } : {}), ...(reply_markup && last ? { reply_markup } : {}), ...(reply_to && i === 0 ? { reply_to_message_id: reply_to } : {}) });
         ids.push(res.message_id);
       } else throw e;
     }
@@ -438,6 +627,17 @@ async function execTool(tool: string, args: any): Promise<any> {
       // buttons present -> set them; absent -> editMessageText clears the keyboard (drop buttons after a tap)
       const rm = normalizeButtons(args.buttons);
       if (rm) body.reply_markup = rm;
+      if (args.format === "rich" && !richDisabled) {
+        const rb: any = { chat_id: args.chat_id, message_id: Number(args.message_id), rich_message: richPayload(args.text) };
+        if (rm) rb.reply_markup = rm;
+        try { return await call("editMessageText", rb); }
+        catch (e: any) {
+          if (isRichCapabilityError(e)) richDisabled = true;
+          if (/not modified/i.test(String(e.message))) return true;
+          LOG(`rich: edit rejected (${e.message}) — plain edit`);
+          body.text = richToPlain(args.text);
+        }
+      }
       try { return await call("editMessageText", body); }
       catch (e: any) {
         if (!body.parse_mode) throw e; // plain edit already; nothing to fall back to
@@ -470,7 +670,7 @@ async function startAsk(reqId: string, args: any) {
   const options = (Array.isArray(args.options) ? args.options : []).map(String).slice(0, 20);
   if (!chat_id || options.length === 0) { writeRes({ id: reqId, ok: false, error: "ask needs chat_id and non-empty options" }); return; }
   const buttons = options.map((o, i) => [{ text: o, data: `ask:${reqId}:${i}` }]);
-  const sent = await sendReply({ chat_id, text: question, format: args.format, buttons });
+  const sent = await sendReply({ chat_id, text: question, format: args.format, buttons, message_thread_id: args.message_thread_id });
   const messageId = sent.message_ids[sent.message_ids.length - 1];
   const timer = setTimeout(() => resolveAsk(reqId, -1, "timeout"), ASK_TIMEOUT_MS);
   pendingAsks.set(reqId, { chat_id, options, messageId, timer });
@@ -513,11 +713,12 @@ function sessionState(): { alive: boolean; detail: string } {
 function lastPollAgo(): number { return status.lastPollOk ? Math.round((Date.now() - new Date(status.lastPollOk).getTime()) / 1000) : -1; }
 
 function sysMenu(chat_id: string) {
-  return sendReply({ chat_id, text: "🎛 Панель управления Claude", buttons: [
+  return sendReply({ chat_id, text: `🎛 Панель управления ${SESSION_LABEL}`, buttons: [
     [{ text: "📊 Статус", data: "sys:status" }, { text: "🔄 Рестарт", data: "sys:restart" }],
     [{ text: "📜 Логи", data: "sys:logs" }, { text: "🖥 Экран", data: "sys:screen" }],
     [{ text: "🗜 /compact", data: "sys:cc:/compact" }, { text: "🧹 /clear", data: "sys:cc:/clear" }],
-    [{ text: "🧠 Модель", data: "sys:models" }, { text: "🔌 MCP", data: "sys:mcp" }],
+    [{ text: "🧠 Модель", data: "sys:models" }, { text: "⚡ Effort", data: "sys:efforts" }],
+    [{ text: "🔌 MCP", data: "sys:mcp" }],
   ] });
 }
 async function sysStatus(chat_id: string) {
@@ -542,16 +743,16 @@ function sysLogs(chat_id: string) {
 }
 function sysScreen(chat_id: string) {
   const c = sh(["tmux", "capture-pane", "-t", TMUX_SESSION, "-p"]);
-  if (!c.ok) return sendReply({ chat_id, text: `🖥 Экран недоступен: ${c.out || "нет сессии " + TMUX_SESSION}` });
+  if (!c.ok) return sendReply({ chat_id, text: `🖥 Экран недоступен: ${c.out || "нет сессии " + SESSION_LABEL}` });
   const out = c.out.split("\n").filter(l => l.trim()).slice(-40).join("\n").slice(-3500);
-  return sendReply({ chat_id, text: "🖥 Экран Claude:\n\n" + (out || "(пусто)") });
+  return sendReply({ chat_id, text: `🖥 Экран ${SESSION_LABEL}:\n\n` + (out || "(пусто)") });
 }
 // Live MCP status: drive the in-session /mcp panel (same send-keys path as /model).
 // Deliberately NOT `claude mcp list` — that spawns a 2nd process that 409-conflicts
 // the long-poller and silently kills the channel. The in-session panel is safe.
 async function sysMcp(chat_id: string) {
   if (!sh(["tmux", "has-session", "-t", TMUX_SESSION]).ok)
-    return sendReply({ chat_id, text: `🔴 Сессия ${TMUX_SESSION} не запущена — панель /mcp показывать негде.` });
+    return sendReply({ chat_id, text: `🔴 Сессия ${SESSION_LABEL} не запущена — панель /mcp показывать негде.` });
   sh(["tmux", "send-keys", "-t", TMUX_SESSION, "-l", "/mcp"]);
   sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"]);
   await sleep(2000);
@@ -566,32 +767,94 @@ async function sysMcp(chat_id: string) {
 async function sysSendKeys(chat_id: string, keys: string) {
   keys = keys.trim();
   if (!keys) return sendReply({ chat_id, text: "Формат: /sys cc <команда>, напр. /sys cc /compact" });
-  if (!sh(["tmux", "has-session", "-t", TMUX_SESSION]).ok) return sendReply({ chat_id, text: `🔴 Сессия ${TMUX_SESSION} не запущена - команду некуда слать.` });
+  if (!sh(["tmux", "has-session", "-t", TMUX_SESSION]).ok) return sendReply({ chat_id, text: `🔴 Сессия ${SESSION_LABEL} не запущена - команду некуда слать.` });
   const r1 = sh(["tmux", "send-keys", "-t", TMUX_SESSION, "-l", keys]);
   const r2 = sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"]);
   if (!r1.ok || !r2.ok) return sendReply({ chat_id, text: `send-keys ошибка: ${r1.out || r2.out}` });
   await sleep(1500);
   const cap = sh(["tmux", "capture-pane", "-t", TMUX_SESSION, "-p"]);
   const out = cap.ok ? cap.out.split("\n").filter(l => l.trim()).slice(-30).join("\n").slice(-3000) : "(экран недоступен)";
-  return sendReply({ chat_id, text: `⌨️ Отправил в Claude: ${keys}\n\n🖥 Экран:\n${out}` });
+  return sendReply({ chat_id, text: `⌨️ Отправил в ${SESSION_LABEL}: ${keys}\n\n🖥 Экран:\n${out}` });
 }
 // Model picker — switches the LIVE session model via the in-session /model command
 // (send-keys, same path as /sys cc). No restart: Claude Code picks the model up on the fly.
-const MODELS: Array<{ label: string; id: string }> = [
-  { label: "Opus 4.8 (1M)", id: "claude-opus-4-8[1m]" },
-  { label: "Opus 4.8", id: "claude-opus-4-8" },
-  { label: "Sonnet 4.6", id: "claude-sonnet-4-6" },
-  { label: "Haiku 4.5", id: "claude-haiku-4-5-20251001" },
+// The list is pulled LIVE from the provider catalogue (GET /v1/models with the
+// same OAuth token the session runs on), so a freshly released model appears in
+// the picker without editing this file. Cached for MODELS_TTL_MS; on any failure
+// falls back to the last good list, then to MODELS_FALLBACK.
+// ctx1m: the catalogue reports a 1M input window, so the picker also offers the
+// "<id>[1m]" variant (Claude Code's opt-in suffix for the long window). The
+// catalogue itself never lists [1m] ids — without this the 1M choice is missing.
+// TG_MODELS_1M=0 hides those buttons (Pro plans don't get the 1M window).
+type ModelOpt = { label: string; id: string; ctx1m?: boolean };
+const MODELS_1M = (process.env.TG_MODELS_1M ?? "1") !== "0";
+const MODELS_FALLBACK: ModelOpt[] = [
+  { label: "Opus 5", id: "claude-opus-5" },
+  { label: "Sonnet 5", id: "claude-sonnet-5" },
   { label: "Fable 5", id: "claude-fable-5" },
+  { label: "Haiku 4.5", id: "claude-haiku-4-5-20251001" },
 ];
-function sysModels(chat_id: string) {
-  const buttons = MODELS.map((m, i) => [{ text: m.label, data: `sys:model:${i}` }]);
-  return sendReply({ chat_id, text: "🧠 Выбери модель (переключение на лету, без рестарта):", buttons });
+const MODELS_TTL_MS = 30 * 60 * 1000;
+const MODELS_MAX = 8;
+const MODELS_URL = process.env.CLAUDE_MODELS_URL ?? "https://api.anthropic.com/v1/models?limit=100";
+let modelsCache: ModelOpt[] = [];
+let modelsCacheAt = 0;
+function oauthToken(): string {
+  const fromEnv = process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim();
+  if (fromEnv) return fromEnv;
+  try { return readFileSync(join(homedir(), ".claude", "secrets", "claude-oauth-token"), "utf8").trim(); } catch { return ""; }
 }
-async function sysSetModel(chat_id: string, idx: string, messageId?: number) {
-  const m = MODELS[Number(idx)];
-  if (!m) return void sendReply({ chat_id, text: "Неизвестная модель." });
-  if (!sh(["tmux", "has-session", "-t", TMUX_SESSION]).ok) return void sendReply({ chat_id, text: `🔴 Сессия ${TMUX_SESSION} не запущена — переключать некого.` });
+async function fetchModels(): Promise<ModelOpt[]> {
+  if (modelsCache.length && Date.now() - modelsCacheAt < MODELS_TTL_MS) return modelsCache;
+  const token = oauthToken();
+  if (!token) { LOG("models: no OAuth token — using fallback list"); return modelsCache.length ? modelsCache : MODELS_FALLBACK; }
+  try {
+    const r = await fetch(MODELS_URL, {
+      headers: { authorization: `Bearer ${token}`, "anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20" },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j: any = await r.json();
+    const list: ModelOpt[] = (Array.isArray(j?.data) ? j.data : [])
+      .filter((m: any) => typeof m?.id === "string")
+      .sort((a: any, b: any) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")))
+      .slice(0, MODELS_MAX)
+      .map((m: any) => ({ label: String(m.display_name ?? m.id).replace(/^Claude\s+/i, ""), id: m.id, ctx1m: Number(m.max_input_tokens ?? 0) >= 1_000_000 }));
+    if (!list.length) throw new Error("empty catalogue");
+    modelsCache = list; modelsCacheAt = Date.now();
+    LOG(`models: catalogue refreshed (${list.length}): ${list.map(m => m.id).join(", ")}`);
+    return modelsCache;
+  } catch (e: any) {
+    LOG(`models: catalogue fetch failed (${e?.message ?? e}) — using ${modelsCache.length ? "cached" : "fallback"} list`);
+    return modelsCache.length ? modelsCache : MODELS_FALLBACK;
+  }
+}
+async function sysModels(chat_id: string) {
+  const models = await fetchModels();
+  const live = modelsCacheAt > 0;
+  // callback carries the model id, not an index: index-based callbacks on old
+  // messages silently pick the wrong model once the list changes
+  const buttons = models.map((m) => {
+    const row = [{ text: m.label, data: `sys:model:${m.id}` }];
+    if (MODELS_1M && m.ctx1m) row.push({ text: `${m.label} · 1M`, data: `sys:model:${m.id}[1m]` });
+    return row;
+  });
+  const note = live ? "" : "\n⚠️ каталог моделей недоступен, список резервный";
+  return sendReply({ chat_id, text: `🧠 Выбери модель (переключение на лету, без рестарта)${note}:`, buttons });
+}
+async function sysSetModel(chat_id: string, key: string, messageId?: number) {
+  const models = await fetchModels();
+  const base1m = key.endsWith("[1m]") ? key.slice(0, -4) : "";
+  const b = base1m ? (models.find((x) => x.id === base1m) ?? MODELS_FALLBACK.find((x) => x.id === base1m)) : undefined;
+  const m = models.find((x) => x.id === key) ?? MODELS_FALLBACK.find((x) => x.id === key)
+    ?? (b ? { label: `${b.label} · 1M`, id: key } : undefined)
+    ?? (/^claude-[a-z0-9.[\]-]+$/i.test(key) ? { label: key, id: key } : undefined);
+  if (!m) {
+    // bare number = index-style callback from a pre-Sep-2026 /model message
+    const stale = /^\d+$/.test(key);
+    return void sendReply({ chat_id, text: stale ? "⚠️ Кнопка из устаревшего сообщения — список моделей с тех пор менялся. Отправь /model заново." : "Неизвестная модель." });
+  }
+  if (!sh(["tmux", "has-session", "-t", TMUX_SESSION]).ok) return void sendReply({ chat_id, text: `🔴 Сессия ${SESSION_LABEL} не запущена — переключать некого.` });
   sh(["tmux", "send-keys", "-t", TMUX_SESSION, "-l", `/model ${m.id}`]);
   sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"]);
   // /model pops a "Switch model?" confirm dialog in the TUI. Headless, nobody sees
@@ -599,9 +862,65 @@ async function sysSetModel(chat_id: string, idx: string, messageId?: number) {
   await sleep(2500);
   let confirmed = false;
   if (/Switch model\?/i.test(paneTail())) { sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"]); confirmed = true; await sleep(1200); }
+  // Don't report success blindly: the catalogue can offer a model this Claude Code
+  // build refuses ("version too old"), and the session prints the error into the
+  // pane while the tap message still claimed "переключил".
+  await sleep(800);
+  const tail = paneTail();
+  const err = /does not support this model[^\n]*/i.exec(tail)
+    ?? /claude_code_version_too_old/i.exec(tail)
+    ?? /API error: \d+[^\n]*/i.exec(tail)
+    ?? /invalid_request_error[^\n]*/i.exec(tail);
+  if (err) {
+    const old = /version (\d+\.\d+\.\d+) or newer is required/i.exec(tail);
+    const hint = old ? `\nНужен Claude Code ${old[1]}+ (сейчас другой). Обнови и повтори.` : "";
+    const bad = `⚠️ Не переключил на ${m.label} (${m.id})\n${err[0].slice(0, 300)}${hint}`;
+    if (messageId) return void call("editMessageText", { chat_id, message_id: messageId, text: bad }).catch(() => sendReply({ chat_id, text: bad }));
+    return void sendReply({ chat_id, text: bad });
+  }
   const txt = `🧠 Переключил на ${m.label}\n(${m.id})${confirmed ? "\n✅ диалог подтверждения нажал за тебя" : ""}`;
   if (messageId) call("editMessageText", { chat_id, message_id: messageId, text: txt }).catch(() => sendReply({ chat_id, text: txt }));
   else sendReply({ chat_id, text: txt });
+}
+// Effort picker — same send-keys path as /model: the in-session `/effort <level>`
+// sets it on the fly and Claude Code itself saves it as the default for new
+// sessions. Which levels a model accepts differs (Haiku has none, older Sonnet
+// has no xhigh), so we don't pre-filter: the session's own answer is relayed.
+const EFFORTS = [
+  { id: "low", label: "low · быстро" },
+  { id: "medium", label: "medium" },
+  { id: "high", label: "high" },
+  { id: "xhigh", label: "xhigh · глубоко" },
+  { id: "max", label: "max · максимум" },
+  { id: "auto", label: "auto · по умолчанию модели" },
+];
+function sysEfforts(chat_id: string) {
+  const buttons = [
+    EFFORTS.slice(0, 3).map((e) => ({ text: e.label, data: `sys:effort:${e.id}` })),
+    EFFORTS.slice(3, 5).map((e) => ({ text: e.label, data: `sys:effort:${e.id}` })),
+    [{ text: EFFORTS[5].label, data: `sys:effort:${EFFORTS[5].id}` }],
+  ];
+  return sendReply({ chat_id, text: "⚡ Выбери effort: насколько долго модель думает перед ответом (на лету, без рестарта):", buttons });
+}
+async function sysSetEffort(chat_id: string, level: string, messageId?: number) {
+  const out = (t: string) => messageId
+    ? void call("editMessageText", { chat_id, message_id: messageId, text: t }).catch(() => sendReply({ chat_id, text: t }))
+    : void sendReply({ chat_id, text: t });
+  if (!EFFORTS.some((e) => e.id === level)) return out(`Неизвестный уровень «${level}». Варианты: ${EFFORTS.map((e) => e.id).join(", ")}`);
+  if (!sh(["tmux", "has-session", "-t", TMUX_SESSION]).ok) return out(`🔴 Сессия ${SESSION_LABEL} не запущена — менять effort некому.`);
+  sh(["tmux", "send-keys", "-t", TMUX_SESSION, "-l", `/effort ${level}`]);
+  sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"]);
+  await sleep(2500);
+  // The pane may still show an answer from an earlier /effort, so judge by the
+  // LAST effort line only, and count success only if it names the level we sent.
+  const re = /(?:Set effort level to|Effort level set to|Effort set to|Invalid argument|exceeds the cap|not supported|does not support)[^\n]*/gi;
+  const last = [...paneTail(40).matchAll(re)].pop()?.[0]?.trim() ?? "";
+  if (/^(?:Set effort level to|Effort level set to|Effort set to)/i.test(last) && last.toLowerCase().includes(level)) {
+    const scope = /this session only/i.test(last) ? "\nДействует до рестарта сессии." : /saved as your default/i.test(last) ? "\nСохранено по умолчанию, переживёт рестарт." : "";
+    return out(`⚡ Effort: ${level}${scope}\n\n${last.slice(0, 300)}`);
+  }
+  if (last && !/^(?:Set effort level to|Effort level set to|Effort set to)/i.test(last)) return out(`⚠️ Effort не поменялся: ${last.slice(0, 300)}`);
+  return out(`⚡ Отправил /effort ${level}, но подтверждения на экране не вижу. Проверь: /screen`);
 }
 // ---------- TUI prompt relay: terminal dialogs -> TG buttons ----------
 // Claude Code occasionally pops an interactive selection dialog in the TUI
@@ -640,7 +959,7 @@ async function relayPrompt(p: { block: string; nOpts: number }) {
   LOG(`relayed TUI prompt (${p.nOpts} options)`);
 }
 async function sysTuiKey(chat_id: string, key: string, messageId?: number) {
-  if (!sh(["tmux", "has-session", "-t", TMUX_SESSION]).ok) return void sendReply({ chat_id, text: `🔴 Сессия ${TMUX_SESSION} не запущена.` });
+  if (!sh(["tmux", "has-session", "-t", TMUX_SESSION]).ok) return void sendReply({ chat_id, text: `🔴 Сессия ${SESSION_LABEL} не запущена.` });
   if (key === "enter") sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"]);
   else if (key === "esc") sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Escape"]);
   else { sh(["tmux", "send-keys", "-t", TMUX_SESSION, "-l", key]); sh(["tmux", "send-keys", "-t", TMUX_SESSION, "Enter"]); }
@@ -652,7 +971,7 @@ async function sysTuiKey(chat_id: string, key: string, messageId?: number) {
   else sendReply({ chat_id, text: txt });
 }
 function sysRestartPrompt(chat_id: string) {
-  return sendReply({ chat_id, text: "🔄 Перезапустить сессию Claude? Демон убьёт и поднимет её заново; входящие в это время буферизуются и догрузятся.", buttons: [
+  return sendReply({ chat_id, text: `🔄 Перезапустить сессию ${SESSION_LABEL}? Демон убьёт и поднимет её заново; входящие в это время буферизуются и догрузятся.`, buttons: [
     [{ text: "✅ Подтвердить", data: "sys:restart:yes" }, { text: "❌ Отмена", data: "sys:restart:no" }],
   ] });
 }
@@ -662,7 +981,7 @@ async function doRestart(chat_id: string, messageId?: number) {
   if (!SYS_RESTART_CMD) return void editOrSend("⚠️ Рестарт не настроен на этом инстансе (SYS_RESTART_CMD пуст).");
   if (Date.now() - lastRestartAt < 60_000) return void editOrSend("⏳ Рестарт уже запускался <1 мин назад. Подожди.");
   lastRestartAt = Date.now();
-  await editOrSend("🔄 Перезапускаю сессию Claude...");
+  await editOrSend(`🔄 Перезапускаю сессию ${SESSION_LABEL}...`);
   const r = sh(["bash", SYS_RESTART_CMD], 20_000);
   await sendReply({ chat_id, text: r.ok ? "✅ Рестарт запущен. Сессия поднимется за ~15с, новый инстанс ответит как будет готов." : `❌ Рестарт не удался: ${r.out}` });
 }
@@ -674,6 +993,7 @@ const BOT_COMMANDS = [
   { command: "screen", description: "Показать экран сессии" },
   { command: "restart", description: "Перезапустить сессию" },
   { command: "model", description: "🧠 Выбрать модель" },
+  { command: "effort", description: "⚡ Уровень effort" },
   { command: "mcp", description: "🔌 Статус MCP-серверов" },
   { command: "logs", description: "Лог gateway" },
 ];
@@ -700,9 +1020,13 @@ async function handleSysCommand(chat_id: string, text: string) {
     case "screen": return sysScreen(chat_id);
     case "restart": return sysRestartPrompt(chat_id);
     case "model": case "models": return sysModels(chat_id);
+    case "effort": {
+      const lvl = (/^\/sys\b/i.test(text) ? text.split(/\s+/)[2] : text.split(/\s+/)[1])?.toLowerCase();
+      return lvl ? sysSetEffort(chat_id, lvl) : sysEfforts(chat_id);
+    }
     case "mcp": return sysMcp(chat_id);
     case "cc": return sysSendKeys(chat_id, text.replace(/^\/sys\s+cc\s*/i, ""));
-    default: return sendReply({ chat_id, text: "Команды: /menu · /sys ping · /sys status · /sys logs · /sys screen · /sys restart · /sys mcp · /sys cc <команда> (напр. /sys cc /compact)" });
+    default: return sendReply({ chat_id, text: "Команды: /menu · /sys ping · /sys status · /sys logs · /sys screen · /sys restart · /sys mcp · /model · /effort [low|medium|high|xhigh|max|auto] · /sys cc <команда> (напр. /sys cc /compact)" });
   }
 }
 
@@ -739,13 +1063,13 @@ function checkBrain() {
   const tell = (t: string) => { for (const a of SYS_ADMINS) sendReply({ chat_id: a, text: t }).catch(() => {}); };
   if (brainWasAlive === null) {
     brainWasAlive = alive;
-    if (!alive) tell(`🔴 Сессия Claude не на связи (heartbeat моста ${age === Infinity ? "отсутствует" : "устарел"}). Входящие буферизуются. Подними её: /restart`);
+    if (!alive) tell(`🔴 Сессия ${SESSION_LABEL} не на связи (heartbeat моста ${age === Infinity ? "отсутствует" : "устарел"}). Входящие буферизуются. Подними её: /restart`);
   } else if (brainWasAlive && !alive) {
     brainWasAlive = false;
-    tell(`🔴 Сессия Claude молчит ~${Math.round(age / 60_000)} мин — мост перестал слать heartbeat. Входящие буферизуются и доедут. Жми /restart, детали: /status`);
+    tell(`🔴 Сессия ${SESSION_LABEL} молчит ~${Math.round(age / 60_000)} мин — мост перестал слать heartbeat. Входящие буферизуются и доедут. Жми /restart, детали: /status`);
   } else if (!brainWasAlive && alive) {
     brainWasAlive = true;
-    tell("🟢 Сессия Claude снова на связи — heartbeat пошёл, бэклог сообщений доезжает.");
+    tell(`🟢 Сессия ${SESSION_LABEL} снова на связи — heartbeat пошёл, бэклог сообщений доезжает.`);
   }
 }
 // ---------- auth-down detector (401 / "Please run /login") ----------
@@ -814,7 +1138,10 @@ async function main() {
   setInterval(() => {
     try {
       const p = detectPrompt();
-      if (!p) { promptFp = ""; promptSeen = 0; return; }
+      // dialog gone: forget what we alerted about, otherwise a repeat of the same
+      // prompt (fp is just the option texts, so "1. Yes|2. No" repeats verbatim)
+      // is never relayed again and the session hangs unseen for hours.
+      if (!p) { promptFp = ""; promptSeen = 0; alertedFp = ""; return; }
       if (p.fp === promptFp) promptSeen++; else { promptFp = p.fp; promptSeen = 1; }
       if (promptSeen === 2 && alertedFp !== p.fp) { alertedFp = p.fp; relayPrompt(p); }
     } catch (e: any) { LOG(`prompt watcher: ${e.message}`); }
@@ -822,9 +1149,10 @@ async function main() {
   // keep "typing…" alive for chats awaiting a reply (Telegram clears it after ~5s)
   setInterval(() => {
     const now = Date.now();
-    for (const [chat, started] of typingChats) {
-      if (now - started > TYPING_MAX_MS) { typingChats.delete(chat); continue; }
-      call("sendChatAction", { chat_id: chat, action: "typing" }).catch(() => {});
+    for (const [key, started] of typingChats) {
+      if (now - started > TYPING_MAX_MS) { typingChats.delete(key); continue; }
+      const [chat, thread] = key.split(":"); // "chat" or "chat:thread"; chat ids never contain a colon
+      call("sendChatAction", { chat_id: chat, ...(thread ? { message_thread_id: Number(thread) } : {}), action: "typing" }).catch(() => {});
     }
   }, 4500);
   // heartbeat + liveness watchdog: if no successful poll in STALE_MS, we're wedged — exit for a clean restart

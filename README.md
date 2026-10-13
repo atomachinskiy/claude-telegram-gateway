@@ -14,7 +14,15 @@
 - **macOS:** `./install-mac.sh`
 - **Linux:** см. AGENTS.md (systemd `--user`).
 
-Нужен только Node 18+ (он уже стоит вместе с Claude Code) и токен бота от [@BotFather](https://t.me/BotFather). Сборка на стороне клиента не требуется — бандлы в `dist/` готовы.
+Нужны Node 18+ и токен бота от [@BotFather](https://t.me/BotFather). Нативный установщик Claude Code (`install.ps1` / `install.sh`) Node не ставит: на Windows `winget install OpenJS.NodeJS.LTS`, на Mac пакет с nodejs.org или архив в домашнюю папку. Сборка на стороне клиента не требуется — бандлы в `dist/` готовы.
+
+## Управление с телефона
+Команды обрабатывает сам демон, поэтому `/menu`, `/status`, `/ping` отвечают, даже когда сессия Claude закрыта. Отвечает только владельцу (`TELEGRAM_SYS_ADMINS`).
+
+На компьютере (Windows, Mac) сессию запускает сам пользователь, поэтому `/restart`, `/model`, `/effort`, `/screen` работают только в серверном режиме, где сессия Claude живёт в tmux. Подробнее в [CHANGELOG.md](CHANGELOG.md).
+
+## Форматы ответа
+Мост отдаёт Claude инструмент `reply` с форматами `text`, `markdownv2` и `rich`. `rich` — обычный GitHub-markdown (таблицы, заголовки, списки) одним сообщением до 32 тыс. знаков.
 
 ## Несколько ботов / воркспейсов
 Один бот = один демон = одна `TELEGRAM_STATE_DIR` = один токен. На Windows `install-windows.ps1` принимает `-StateDir` / `-TaskName` / `-LauncherName` — запусти его по разу на каждого бота. Плагин-мост и allowlist общие, ставятся один раз. Детали — в AGENTS.md (раздел Notes).
