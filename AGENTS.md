@@ -85,7 +85,7 @@ Replace `REPLACE_HOME` with `$HOME` (absolute). Then:
 launchctl unload ~/Library/LaunchAgents/com.tg-gateway.plist 2>/dev/null
 launchctl load  ~/Library/LaunchAgents/com.tg-gateway.plist
 ```
-Verify: `launchctl list | grep tg-gateway` shows it, and the log has `registered 8 bot commands`. Note: `node` must be on launchd's PATH; if not, use the absolute node path (`which node`) instead of `/usr/bin/env node`.
+Verify: `launchctl list | grep tg-gateway` shows it, and the log has `registered N bot commands` (N = 9 in v1.2.0). Note: `node` must be on launchd's PATH; if not, use the absolute node path (`which node`) instead of `/usr/bin/env node`.
 
 ### Windows — Scheduled Task
 PowerShell (per-user; runs at logon, restarts on failure):
@@ -146,7 +146,7 @@ macOS/Linux — add a `claude-tg` function/alias to the shell rc (with `export T
 
 ## 4. Verify end-to-end
 
-1. Daemon up: supervisor shows it running; `$STATE/gateway.status.json` updates; log has `registered 8 bot commands`.
+1. Daemon up: supervisor shows it running; `$STATE/gateway.status.json` updates; log has `registered N bot commands` (N = 9 in v1.2.0).
 2. User runs `claude-tg` (a Claude Code session with the bridge).
 3. From Telegram, the user sends the bot a message → it should appear in the Claude Code session, and Claude's reply should arrive back in Telegram. The bot should also react (👀/etc.) and show "typing…".
 4. In Telegram type `/menu` — a control panel should appear (handled by the daemon).
