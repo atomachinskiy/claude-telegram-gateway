@@ -54,14 +54,33 @@ if ((Test-Path $envFile) -and (Select-String -Path $envFile -Pattern '^TELEGRAM_
 # 2. Scheduled Task supervisor (at logon, restart on failure). Use a .cmd wrapper
 #    so TELEGRAM_STATE_DIR is carried into the process.
 Say "installing Scheduled Task '$TaskName' [VERIFY-PILOT]"
+# Re-run safe: stop the old task and its daemon, so the new wrapper and settings take effect now.
+Stop-ScheduledTask -TaskName $TaskName -EA SilentlyContinue
+$lock = Join-Path $State "gateway.lock"
+if (Test-Path $lock) {
+  $oldPid = (Get-Content $lock -EA SilentlyContinue | Select-Object -First 1) -as [int]
+  $old = if ($oldPid) { Get-Process -Id $oldPid -EA SilentlyContinue }
+  if ($old -and $old.ProcessName -eq "node") { Stop-Process -Id $oldPid -Force -EA SilentlyContinue }
+}
+$Log = Join-Path $State "gateway.log"
+# The wrapper restarts the daemon after any exit (its own watchdog exits on purpose when
+# polling is stuck) and logs everything: a Scheduled Task has no visible stderr.
 @"
 @echo off
+title tg-gateway - do not close this window
 set TELEGRAM_STATE_DIR=$State
-"$Node" "$Gw"
+:loop
+if exist "$Log" for %%A in ("$Log") do if %%~zA GTR 5000000 move /y "$Log" "$Log.1" >nul
+echo [%date% %time%] starting tg-gateway>>"$Log"
+"$Node" "$Gw" >>"$Log" 2>&1
+echo [%date% %time%] tg-gateway exited with code %errorlevel%, restarting in 10 s>>"$Log"
+ping -n 11 127.0.0.1 >nul
+goto loop
 "@ | Set-Content -Path $Wrapper -Encoding ASCII
 $action   = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$Wrapper`""
 $trigger  = New-ScheduledTaskTrigger -AtLogOn
-$settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+# ExecutionTimeLimit 0 = no limit. The Windows default (72 h) kills the daemon every 3 days.
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -RunLevel Limited -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 Start-Sleep 2
